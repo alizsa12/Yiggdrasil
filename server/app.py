@@ -22,6 +22,7 @@ import json
 import mimetypes
 import os
 import random
+import re
 import socket
 import sys
 import threading
@@ -61,6 +62,7 @@ class AmbientAgent:
         self._thread: threading.Thread | None = None
         self._recent: deque[str] = deque(maxlen=8)
         self._queries: deque[str] = deque(maxlen=3)
+        self._errors = 0
 
     def start(self) -> None:
         if self._thread:
@@ -70,6 +72,24 @@ class AmbientAgent:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _note_error(self) -> None:
+        """Report a failed tick instead of swallowing it.
+
+        The simulator must never kill the server, but a silent `pass` here
+        hides real defects — a missing import in this module went unnoticed
+        for exactly that reason. Print the first few tracebacks in full, then
+        throttle so a persistent fault cannot flood the console.
+        """
+        self._errors += 1
+        if self._errors > 3 and self._errors % 25:
+            return
+        try:
+            sys.stderr.write(
+                f"ambient agent: tick failed (error #{self._errors})\n{traceback.format_exc()}")
+            sys.stderr.flush()
+        except (OSError, UnicodeError):
+            pass
 
     def _loop(self) -> None:
         rng = random.Random(7)
@@ -126,7 +146,7 @@ class AmbientAgent:
                     self.store.log_activity("retrieve", detail="ambient self-check → tree healthy",
                                             duration_ms=rng.randint(3, 12), actor="agent")
             except Exception:
-                pass
+                self._note_error()
 
 
 ambient = AmbientAgent(store)

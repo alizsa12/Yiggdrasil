@@ -119,6 +119,17 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
 
+def _pair(a: str, b: str) -> tuple[str, str]:
+    """Canonical ordering for the two ends of an undirected link.
+
+    A link has no direction: (a,b) and (b,a) must land on the same row, which
+    is what makes the upsert on UNIQUE(a,b) idempotent. Every path that writes
+    or reads a link pair goes through here, so the stored order can never
+    disagree with the order the activity log or the event stream reports.
+    """
+    return (a, b) if a <= b else (b, a)
+
+
 def tokenize(text: str) -> list[str]:
     return [t for t in TOKEN_RE.findall((text or "").lower()) if t and t not in STOPWORDS]
 
@@ -408,6 +419,11 @@ class Store:
         if hard:
             self.x(f"DELETE FROM links WHERE a IN ({','.join('?' * len(mem_ids))}) "
                    f"OR b IN ({','.join('?' * len(mem_ids))})", tuple(mem_ids) * 2)
+            # The activity log is an audit trail: keep the rows and the text they
+            # carry, but drop the ids that are about to stop resolving to anything.
+            self.x("UPDATE activity SET memory_id=NULL, node_id=NULL WHERE memory_id IN "
+                   f"({','.join('?' * len(mem_ids))}) OR node_id IN ({','.join('?' * len(subtree))})",
+                   (*mem_ids, *subtree))
             self.x(f"DELETE FROM memories WHERE id IN ({','.join('?' * len(mem_ids))})", tuple(mem_ids))
             self.x(f"DELETE FROM nodes WHERE id IN ({','.join('?' * len(subtree))})", tuple(subtree))
             action = "forget"
@@ -418,7 +434,10 @@ class Store:
             action = "archive"
             detail = f"archived “{memory['title']}”"
 
-        self.log_activity(action, memory=memory, detail=detail, actor=actor)
+        # after a hard delete the memory row is gone, so this event carries the
+        # title only — never an id that no longer resolves
+        self.log_activity(action, memory=None if hard else memory,
+                          title=memory["title"], detail=detail, actor=actor)
         self._mirror()
         self._emit({"type": "memory", "action": action, "id": memory_id})
         return {"forgotten": mem_ids, "hard": hard}
@@ -497,7 +516,7 @@ class Store:
             raise ValueError("cannot link a memory to itself")
         if not self.memory(a_id) or not self.memory(b_id):
             raise KeyError("unknown memory id")
-        a, b = sorted((a_id, b_id))
+        a, b = _pair(a_id, b_id)
         self.x(
             """INSERT INTO links(id,a,b,type,weight,note,created_at) VALUES(?,?,?,?,?,?,?)
                ON CONFLICT(a,b) DO UPDATE SET weight=excluded.weight, note=excluded.note, type=excluded.type""",
@@ -506,15 +525,18 @@ class Store:
         row = self.q("SELECT * FROM links WHERE a=? AND b=?", (a, b))[0]
         link = dict(row)
         if log:
-            self.log_activity("link", memory=self.memory(a_id),
-                              detail=f"linked “{self.memory(a_id)['title']}” ↔ “{self.memory(b_id)['title']}”",
+            # the log names the canonical pair, so the audit trail agrees with
+            # the stored row no matter which order the caller supplied
+            self.log_activity("link", memory=self.memory(a),
+                              title=self.memory(a)["title"],
+                              detail=f"linked “{self.memory(a)['title']}” ↔ “{self.memory(b)['title']}”",
                               actor=actor)
         self._mirror()
         self._emit({"type": "link", "action": "link", "link": link})
         return link
 
     def unlink(self, a_id: str, b_id: str) -> bool:
-        a, b = sorted((a_id, b_id))
+        a, b = _pair(a_id, b_id)
         cur = self.x("DELETE FROM links WHERE a=? AND b=?", (a, b))
         self._mirror()
         self._emit({"type": "link", "action": "unlink", "ids": [a, b]})
@@ -642,6 +664,7 @@ class Store:
         duration_ms: int | None = None,
         score: float | None = None,
         tokens: int | None = None,
+        title: str = "",
     ) -> dict:
         now = _now()
         cur = self.x(
@@ -649,7 +672,7 @@ class Store:
                VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (now, action, actor, memory["id"] if memory else None,
              memory["node_id"] if memory else None,
-             memory["title"] if memory else "", detail, duration_ms, score, tokens),
+             memory["title"] if memory else title, detail, duration_ms, score, tokens),
         )
         row = self.q("SELECT * FROM activity WHERE id=?", (cur.lastrowid,))[0]
         entry = dict(row)
@@ -809,7 +832,7 @@ class Store:
                      raw.get("version", 1), raw.get("status", "active"), raw.get("merged_into")),
                 )
             for raw in payload.get("links", []):
-                a, b = sorted((id_map.get(raw["a"], raw["a"]), id_map.get(raw["b"], raw["b"])))
+                a, b = _pair(id_map.get(raw["a"], raw["a"]), id_map.get(raw["b"], raw["b"]))
                 conn.execute(
                     "INSERT OR REPLACE INTO links(id,a,b,type,weight,note,created_at) VALUES(?,?,?,?,?,?,?)",
                     (raw.get("id", new_id("lnk")), a, b, raw.get("type", "related"),

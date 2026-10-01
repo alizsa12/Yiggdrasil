@@ -136,6 +136,53 @@ def main():
     store.log_activity("note", detail="hello")
     check("activity feed is newest-first", store.recent_activity(1)[0]["detail"] == "hello")
 
+    print("\nreferential integrity")
+    doomed2 = store.remember("Smoke test memory (purged)", "temporary", parent_id=leaf["parent_id"])
+    store.link(doomed2["id"], other["id"])
+    store.context(doomed2["id"], hops=1)
+    store.log_activity("read", memory=store.memory(doomed2["id"]), detail="read before the purge")
+    store.forget(doomed2["id"], hard=True)
+    dangling = store.q("SELECT COUNT(*) c FROM activity WHERE memory_id IS NOT NULL AND memory_id NOT IN "
+                       "(SELECT id FROM memories)")[0]["c"]
+    orphan_nodes = store.q("SELECT COUNT(*) c FROM activity WHERE node_id IS NOT NULL AND node_id NOT IN "
+                           "(SELECT id FROM nodes)")[0]["c"]
+    check("hard forget leaves no dangling memory refs", dangling == 0, dangling)
+    check("hard forget leaves no dangling node refs", orphan_nodes == 0, orphan_nodes)
+    kept = [a for a in store.recent_activity(200) if a["memory_id"] == doomed2["id"]]
+    check("the purge is still recorded in the audit trail", not kept and any(
+        a["action"] == "forget" and doomed2["title"] in (a["title"] or "") for a in store.recent_activity(200)))
+    check("links to a purged memory are gone",
+          not any(doomed2["id"] in (l["a"], l["b"]) for l in store.map_links()))
+
+    print("\nlink symmetry")
+    x, y = store.remember("Link symmetry left", "a"), store.remember("Link symmetry right", "b")
+    fwd = store.link(x["id"], y["id"])
+    rev = store.link(y["id"], x["id"])
+    check("link order is canonical either way round", fwd["a"] == rev["a"] and fwd["b"] == rev["b"], (fwd, rev))
+    check("relinking does not duplicate the row", len(store.map_links()) == len(
+        {frozenset((l["a"], l["b"])) for l in store.map_links()}))
+    logged = [a for a in store.recent_activity(200) if a["action"] == "link" and a["memory_id"] == fwd["a"]]
+    check("the activity log names the stored end", bool(logged), logged[:1])
+    check("unlink works from either order", store.unlink(y["id"], x["id"])
+          and store.unlink(x["id"], y["id"]) is False)
+
+    print("\nambient agent")
+    os.environ["YGGDRASIL_DATA"] = os.path.join(tmp, "ambient")
+    from server import app as app_mod  # noqa: E402  (import-time store honours YGGDRASIL_DATA)
+    seed_mod.seed(app_mod.store)
+    agent = app_mod.AmbientAgent(app_mod.store, interval=0.01)
+    quiet_before = len(app_mod.store.recent_activity(5000))
+    agent.start()
+    deadline = time.time() + 2.0
+    while time.time() < deadline and agent._errors == 0:  # noqa: SLF001 - internal counter
+        time.sleep(0.05)
+    agent.stop()
+    agent._thread.join(timeout=2.0)  # noqa: SLF001
+    check("ambient ticks run without raising", agent._errors == 0,  # noqa: SLF001
+          f"{agent._errors} failed ticks")  # noqa: SLF001
+    check("the ambient agent actually did something",
+          len(app_mod.store.recent_activity(5000)) > quiet_before)
+
     print(f"\n{'all green' if not failed else str(failed) + ' failing'} — {passed} passed\n")
     return 1 if failed else 0
 
