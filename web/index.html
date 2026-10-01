@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Yggdrasil · AI memory</title>
+<link rel="stylesheet" href="styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🌳</text></svg>" />
+</head>
+<body>
+  <canvas id="stage" aria-label="Yggdrasil memory tree"></canvas>
+  <div id="grain" aria-hidden="true"></div>
+  <div id="boot">
+    <div class="boot-inner">
+      <div class="boot-mark"></div>
+      <p>growing the canopy…</p>
+    </div>
+  </div>
+
+  <header id="topbar">
+    <div class="brand" id="brand">
+      <svg viewBox="0 0 40 40" class="mark" aria-hidden="true">
+        <defs>
+          <linearGradient id="markGrad" x1="0" y1="1" x2="1" y2="0">
+            <stop offset="0%" stop-color="#fff6e2" />
+            <stop offset="60%" stop-color="#f0c574" />
+            <stop offset="100%" stop-color="#b4762a" />
+          </linearGradient>
+        </defs>
+        <path d="M20 37 V14 M20 20 L9 9 M20 24 L31 11 M20 29 L12 19 M20 31 L28 22"
+              stroke="url(#markGrad)" stroke-width="2.1" fill="none" stroke-linecap="round" />
+        <circle cx="20" cy="37" r="3.4" fill="url(#markGrad)" />
+        <circle cx="9" cy="9" r="2.1" fill="#fff3d6" />
+        <circle cx="31" cy="11" r="2.1" fill="#f0c574" />
+        <circle cx="12" cy="19" r="1.5" fill="#ffe6b0" />
+        <circle cx="28" cy="22" r="1.5" fill="#d59a45" />
+      </svg>
+      <div class="brand-text">
+        <h1>YGGDRASIL</h1>
+        <span class="agent"><i id="live-dot"></i><span id="agent-name">agent</span> · the world tree of memory</span>
+      </div>
+    </div>
+
+    <div class="searchwrap">
+      <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <path d="M16.5 16.5 L21 21" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+      </svg>
+      <input id="search" type="search" autocomplete="off" spellcheck="false"
+             placeholder="Search every leaf…  press /" aria-label="Search memories" />
+      <kbd class="hint-key">/</kbd>
+      <button id="search-clear" class="ghost" title="Clear" aria-label="Clear search">esc</button>
+      <div id="search-results" class="results" hidden></div>
+    </div>
+
+    <nav class="views" role="tablist" aria-label="View">
+      <button data-view="tree" class="active" role="tab"><span>Tree</span><kbd>1</kbd></button>
+      <button data-view="timeline" role="tab"><span>Timeline</span><kbd>2</kbd></button>
+      <button data-view="graph" role="tab"><span>Graph</span><kbd>3</kbd></button>
+    </nav>
+
+    <div class="top-actions">
+      <button id="sim-toggle" class="pill" title="Toggle ambient agent activity">
+        <span class="dot"></span><span id="sim-label">agent live</span>
+      </button>
+      <button id="new-memory" class="primary" title="Plant a memory  (N)">+ Remember</button>
+    </div>
+  </header>
+
+  <aside id="left-rail" class="rail">
+    <button class="rail-collapse" data-target="left-rail" title="Collapse">‹</button>
+    <section class="pulse">
+      <h2>Pulse</h2>
+      <div id="stats" class="stats"></div>
+    </section>
+    <section class="branches">
+      <div class="section-head">
+        <h2>Nine Realms</h2>
+        <button id="expand-all" class="link-btn" title="Expand every branch">all open</button>
+      </div>
+      <ul id="domain-list" class="domain-list"></ul>
+    </section>
+    <section class="controls">
+      <h2>Flight</h2>
+      <div class="control-row">
+        <button id="btn-frame" class="ghost wide">frame all <kbd>F</kbd></button>
+        <button id="btn-links" class="ghost wide on">links <kbd>L</kbd></button>
+      </div>
+      <label class="slider">
+        <span>luminance</span>
+        <input id="glow" type="range" min="0" max="100" value="100" />
+      </label>
+      <label class="switch">
+        <input id="spin" type="checkbox" checked />
+        <span>idle drift</span>
+      </label>
+    </section>
+    <section class="legend">
+      <h2>Legend</h2>
+      <ul class="legend-list">
+        <li><i class="swatch root"></i> heart · identity</li>
+        <li><i class="swatch domain"></i> realm · a world of memory</li>
+        <li><i class="swatch branch"></i> limb · projects, people, topics</li>
+        <li><i class="swatch leaf"></i> neuron · one memory</li>
+        <li><i class="swatch vein"></i> vessel · a relationship</li>
+      </ul>
+      <p class="rivers">fed by four rivers — Gjöll · Höð · Rán · Sjáld</p>
+      <p class="tip">drag to orbit · scroll to zoom · click a realm to enter it · double-click empty space to frame</p>
+    </section>
+  </aside>
+
+  <aside id="right-rail" class="rail">
+    <button class="rail-collapse right" data-target="right-rail" title="Collapse">›</button>
+    <div class="rail-tabs">
+      <button data-panel="activity" class="active">Agent activity</button>
+      <button data-panel="memory">Memory</button>
+    </div>
+    <div id="activity-panel" class="panel-scroll">
+      <div class="activity-head">
+        <span id="activity-count">—</span>
+        <div class="filters" id="activity-filters">
+          <button data-action="all" class="active">all</button>
+          <button data-action="retrieve">recall</button>
+          <button data-action="update">write</button>
+        </div>
+      </div>
+      <ul id="activity-feed" class="feed"></ul>
+    </div>
+    <div id="memory-panel" class="panel-scroll" hidden></div>
+  </aside>
+
+  <div id="realm-bar" class="realm-bar" hidden>
+    <button id="realm-exit" class="ghost" title="Rise back out of the realm  (Esc)">‹ rise out</button>
+    <div class="realm-name">
+      <span class="eyebrow">inside the realm of</span>
+      <strong id="realm-title">—</strong>
+      <span id="realm-note">—</span>
+    </div>
+    <div class="realm-count"><b id="realm-memories">0</b> memories grown here</div>
+  </div>
+
+  <div id="tooltip" class="tooltip" hidden></div>
+  <div id="toasts" class="toasts"></div>
+  <div id="modal-root"></div>
+  <div id="view-note" class="view-note" hidden></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

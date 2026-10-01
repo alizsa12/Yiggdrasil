@@ -1,0 +1,4 @@
+data/
+*.log
+logs_test.txt
+__pycache__/
