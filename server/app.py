@@ -244,12 +244,18 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/memories/"):
                 rest = path[len("/api/memories/"):]
                 if rest.endswith("/context"):
-                    return self._json(store.context(rest[: -len("/context")],
-                                                    hops=int(self._qs().get("hops", 1))))
-                try:
-                    return self._json(store.memory(rest))
-                except KeyError:
+                    try:
+                        return self._json(store.context(rest[: -len("/context")],
+                                                        hops=int(self._qs().get("hops", 1))))
+                    except KeyError:
+                        return self._error(404, "no such memory")
+                # store.memory() returns None for an unknown id, so the answer has
+                # to be checked -- the old except KeyError here could never fire
+                # and an unknown id came back as 200 null
+                memory = store.memory(rest)
+                if memory is None:
                     return self._error(404, "no such memory")
+                return self._json(memory)
             if path.startswith("/api/nodes/"):
                 node = store.node(path[len("/api/nodes/"):])
                 return self._json(node) if node else self._error(404, "no such node")
@@ -274,20 +280,26 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._body()
             if path == "/api/remember":
-                parent = body.get("parent_id") or self._resolve_parent(body)
-                memory = store.remember(
-                    title=body.get("title", ""),
-                    content=body.get("content", ""),
-                    parent_id=parent,
-                    kind=body.get("kind", "fact"),
-                    domain=body.get("domain", ""),
-                    tags=body.get("tags") or [],
-                    importance=float(body.get("importance", 0.5)),
-                    confidence=float(body.get("confidence", 0.7)),
-                    source=body.get("source", "operator"),
-                    actor=body.get("actor", "operator"),
-                    link_to=body.get("link_to") or [],
-                )
+                try:
+                    parent = body.get("parent_id") or self._resolve_parent(body)
+                    memory = store.remember(
+                        title=body.get("title", ""),
+                        content=body.get("content", ""),
+                        parent_id=parent,
+                        kind=body.get("kind", "fact"),
+                        domain=body.get("domain", ""),
+                        tags=body.get("tags") or [],
+                        importance=float(body.get("importance", 0.5)),
+                        confidence=float(body.get("confidence", 0.7)),
+                        source=body.get("source", "operator"),
+                        actor=body.get("actor", "operator"),
+                        link_to=body.get("link_to") or [],
+                    )
+                except KeyError as exc:
+                    # an unknown id in link_to is the caller's mistake, not a fault
+                    return self._error(404, f"unknown memory {exc}")
+                except ValueError as exc:
+                    return self._error(400, str(exc))
                 return self._json(memory, 201)
             if path == "/api/recall":
                 return self._json({"results": store.recall(

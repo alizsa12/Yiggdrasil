@@ -11,7 +11,12 @@ Two modes, one interface:
     mem.forget(mem_id)
 
     # in-process (tools/tests, no server needed)
-    mem = Yggdrasil(store=Store("data/yggdrasil.db", "data/yggdrasil.json"))
+    store = Store("data/yggdrasil.db", "data/yggdrasil.json")
+    mem = store.remember("Mira prefers terse answers", domain="Preferences")
+
+This client speaks HTTP only. For in-process use call `Store` directly -- it
+has the same verbs (`remember`, `recall`, `link`, `merge`, `forget`) without a
+server, and it is what the tests drive.
 
 Every call is one line and every call is recorded in the agent's activity log,
 which is what the UI renders on the right rail.
@@ -34,17 +39,14 @@ class YggdrasilError(RuntimeError):
 
 
 class Yggdrasil:
-    def __init__(self, base_url: str | None = None, store=None, actor: str = "agent",
+    def __init__(self, base_url: str | None = None, actor: str = "agent",
                  timeout: float = 8.0) -> None:
         self.base_url = (base_url or DEFAULT_URL).rstrip("/")
-        self.store = store          # optional in-process mode
         self.actor = actor
         self.timeout = timeout
 
     # ------------------------------------------------------------------ transport
     def _request(self, method: str, path: str, payload: dict | None = None) -> Any:
-        if self.store is not None:
-            raise YggdrasilError("in-process mode: call the store methods directly")
         url = f"{self.base_url}{path}"
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(url, data=data, method=method)
@@ -91,7 +93,8 @@ class Yggdrasil:
 
     def forget(self, memory_id: str, hard: bool = False) -> dict:
         """Archive by default; `hard=True` deletes the leaf and its subtree."""
-        return self._request("DELETE", f"/api/memories/{memory_id}?hard={int(hard)}&actor={self.actor}")
+        qs = urllib.parse.urlencode({"hard": int(hard), "actor": self.actor})
+        return self._request("DELETE", f"/api/memories/{memory_id}?{qs}")
 
     def link(self, memory_a: str, memory_b: str, type: str = "related", weight: float = 0.6,
              note: str = "") -> dict:
@@ -101,7 +104,8 @@ class Yggdrasil:
         })
 
     def unlink(self, memory_a: str, memory_b: str) -> bool:
-        return self._request("DELETE", f"/api/link?a={memory_a}&b={memory_b}")["unlinked"]
+        qs = urllib.parse.urlencode({"a": memory_a, "b": memory_b})
+        return self._request("DELETE", f"/api/link?{qs}")["unlinked"]
 
     def merge(self, memory_a: str, memory_b: str, title: str | None = None) -> dict:
         """Fold b into a, inheriting tags, links and the stronger importance."""

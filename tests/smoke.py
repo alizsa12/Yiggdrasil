@@ -3,10 +3,14 @@
     python yggdrasil/tests/smoke.py
 """
 
+import json
 import os
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -26,6 +30,26 @@ def check(label, condition, detail=""):
     else:
         failed += 1
         print(f"  [FAIL] {label}  {detail}")
+
+
+def raises(fn):
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
+
+
+def http(method: str, url: str, payload=None):
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            return resp.status, (json.loads(body) if body else None)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")[:120]
 
 
 def main():
@@ -134,6 +158,9 @@ def main():
           foreign.kv_get("root_id") in fnodes, (old_root, foreign.kv_get("root_id")))
     check("a replaced tree inherits no stale agent identity",
           foreign.kv_get("agent_name") != old_agent, (old_agent, foreign.kv_get("agent_name")))
+    flive = {m["id"] for m in foreign.map_memories(include_archived=True)}
+    check("a replaced tree leaves no dangling activity refs",
+          all(not r["memory_id"] or r["memory_id"] in flive for r in foreign.recent_activity(500)))
 
     hostile = {
         "meta": {"root_id": "nd_gone"},          # points at a node the payload lacks
@@ -227,6 +254,75 @@ def main():
     check("unlink works from either order", store.unlink(y["id"], x["id"])
           and store.unlink(x["id"], y["id"]) is False)
 
+    print("\nretrieval")
+    store.remember("Banana bread recipe", "bananas flour oven", parent_id=leaf["parent_id"])
+    unrelated = store.search("walrus operator zzzz")
+    check("a query matching nothing returns nothing", unrelated == [], unrelated)
+    # two memories with identical text: the one the agent already knows should win
+    known = store.remember("Quibbleton ordering probe", "shared body text",
+                           parent_id=leaf["parent_id"], tags=["kryptonite"], importance=0.45)
+    rival = store.remember("Quibbleton ordering probe", "shared body text",
+                           parent_id=leaf["parent_id"], importance=0.60)
+    for _ in range(6):
+        store.recall("kryptonite", limit=1)
+    ranked = store.recall("Quibbleton ordering probe", limit=5, record=False)
+    scores = [round(m["score"], 3) for m in ranked]
+    check("recall returns results in score order", scores == sorted(scores, reverse=True), scores)
+    check("exposure can lift a memory above a higher-importance one",
+          bool(ranked) and ranked[0]["id"] == known["id"],
+          [(m["id"][:12], m["score"]) for m in ranked])
+    for suffix in ("alpha", "beta", "gamma"):
+        store.remember(f"Limit probe {suffix}", "shared body text", parent_id=leaf["parent_id"])
+    check("a negative limit cannot slice the tail off the results",
+          len(store.search("Limit probe", limit=-1)) == 1,
+          len(store.search("Limit probe", limit=-1)))
+    check("an absurd limit is capped", len(store.search("", limit=10 ** 9)) <= 500)
+
+    print("\nwrite safety")
+    before = len(store.map_memories())
+    check("remember with an unknown link_to raises",
+          raises(lambda: store.remember("Half written", "x", parent_id=leaf["parent_id"],
+                                        link_to=["mem_does_not_exist"])))
+    check("...and commits nothing", len(store.map_memories()) == before,
+          (before, len(store.map_memories())))
+
+    survivor = store.remember("Merge weight survivor", "x", parent_id=leaf["parent_id"])
+    source = store.remember("Merge weight source", "y", parent_id=leaf["parent_id"])
+    neighbour = store.remember("Merge weight neighbour", "z", parent_id=leaf["parent_id"])
+    store.link(source["id"], neighbour["id"], weight=0.95)
+    store.merge(survivor["id"], source["id"])
+    inherited = [l for l in store.map_links()
+                 if survivor["id"] in (l["a"], l["b"]) and neighbour["id"] in (l["a"], l["b"])]
+    check("merge keeps the weight of an inherited link",
+          bool(inherited) and abs(inherited[0]["weight"] - 0.95) < 1e-6, inherited)
+
+    probe = store.remember("No-op tag probe", "t", parent_id=leaf["parent_id"], tags=["alpha", "beta"])
+    store.update(probe["id"], {"tags": ["alpha", "beta"]})
+    noisy = [a["detail"] for a in store.recent_activity(20) if a["action"] == "update"]
+    check("an unchanged tags list is not reported as a change",
+          not any("tags" in (d or "") for d in noisy), noisy)
+
+    print("\ntransactional import")
+    tx = Store(os.path.join(tmp, "tx.db"), None)
+    seed_mod.seed(tx)
+    nodes_before, mems_before = len(tx.map_nodes()), len(tx.map_memories())
+    broken = {
+        "meta": {"agent": "someone-else"},
+        "nodes": [{"id": "nd_import", "parent_id": None, "name": "New", "kind": "root"}],
+        # tags that cannot be serialised: the failure lands after the node insert
+        "memories": [{"id": "mem_import", "node_id": "nd_import", "title": "Bad", "tags": [object()]}],
+        "links": [],
+    }
+    check("a failing import raises", raises(lambda: tx.load_payload(broken, replace=True)))
+    check("a failing import leaves the old tree intact",
+          len(tx.map_nodes()) == nodes_before and len(tx.map_memories()) == mems_before,
+          (nodes_before, len(tx.map_nodes()), mems_before, len(tx.map_memories())))
+
+    print("\nclient")
+    from server.client import Yggdrasil  # noqa: E402
+    check("the client no longer advertises an in-process mode", not hasattr(Yggdrasil(), "store"))
+    check("passing a store to the client is a TypeError", raises(lambda: Yggdrasil(store=object())))
+
     print("\nambient agent")
     os.environ["YGGDRASIL_DATA"] = os.path.join(tmp, "ambient")
     from server import app as app_mod  # noqa: E402  (import-time store honours YGGDRASIL_DATA)
@@ -243,6 +339,29 @@ def main():
           f"{agent._errors} failed ticks")  # noqa: SLF001
     check("the ambient agent actually did something",
           len(app_mod.store.recent_activity(5000)) > quiet_before)
+
+    print("\nhttp status codes")
+    port = app_mod._free_port("127.0.0.1", 8470)  # noqa: SLF001
+    httpd = app_mod.serve("127.0.0.1", port, seed_if_empty=False, simulate=False)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        code, _ = http("GET", base + "/api/memories/mem_does_not_exist")
+        check("an unknown memory is 404, not 200 null", code == 404, code)
+        code, _ = http("GET", base + "/api/memories/mem_does_not_exist/context")
+        check("an unknown memory's context is 404, not 500", code == 404, code)
+        live = len(app_mod.store.map_memories())
+        code, _ = http("POST", base + "/api/remember",
+                       {"title": "Rejected write", "link_to": ["mem_does_not_exist"]})
+        check("remember with an unknown link_to is a 404", code == 404, code)
+        check("...and creates nothing", len(app_mod.store.map_memories()) == live,
+              (live, len(app_mod.store.map_memories())))
+        code, body = http("GET", base + "/api/links-that-dont-exist")
+        check("an unknown endpoint is 404", code == 404, code)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
     print(f"\n{'all green' if not failed else str(failed) + ' failing'} — {passed} passed\n")
     return 1 if failed else 0

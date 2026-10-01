@@ -119,6 +119,19 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
 
+def _limit(value: Any, default: int, ceiling: int = 500) -> int:
+    """Clamp a caller-supplied limit.
+
+    A negative limit is not an error to the list it slices -- `rows[:-5]` drops
+    the tail and returns almost everything -- so it has to be rejected here.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(n, ceiling))
+
+
 def _pair(a: str, b: str) -> tuple[str, str]:
     """Canonical ordering for the two ends of an undirected link.
 
@@ -321,6 +334,12 @@ class Store:
         parent = self.node(parent_id)
         if parent is None:
             raise ValueError(f"unknown parent node: {parent_id}")
+        # resolve every link target *before* writing anything: a bad link_to used to
+        # raise after the memory and its leaf were committed, so the caller's retry
+        # produced a duplicate of a memory it had already been told had failed
+        for other in link_to or []:
+            if self.memory(other) is None:
+                raise KeyError(other)
 
         now = _now()
         mid = new_id("mem")
@@ -366,7 +385,12 @@ class Store:
             if key not in allowed:
                 continue
             if key == "tags":
-                value = json.dumps([str(t) for t in (value or [])])
+                tags = [str(t) for t in (value or [])]
+                # compare before serialising: memory["tags"] is a list, so comparing
+                # it to the JSON string reported a change on every no-op update
+                if list(memory.get("tags") or []) != tags:
+                    changed.append("tags")
+                value = json.dumps(tags)
             if key == "importance":
                 value = max(0.0, min(1.0, float(value)))
             if key == "confidence":
@@ -384,7 +408,7 @@ class Store:
                 self._prune_collapsed(value)
                 changed.append("location")
                 continue
-            if memory.get(key) != value:
+            if key != "tags" and memory.get(key) != value:
                 changed.append(key)
             sets.append(f"{key}=?")
             params.append(value)
@@ -481,13 +505,15 @@ class Store:
         for row in self.q("SELECT * FROM links WHERE b=?", (b_id,)):
             if row["a"] != a_id:
                 try:
-                    self.link(a_id, row["a"], type=row["type"], note=row["note"], actor=actor, log=False)
+                    self.link(a_id, row["a"], type=row["type"], weight=row["weight"],
+                              note=row["note"], actor=actor, log=False)
                 except ValueError:
                     pass
         for row in self.q("SELECT * FROM links WHERE a=?", (b_id,)):
             if row["b"] != a_id:
                 try:
-                    self.link(a_id, row["b"], type=row["type"], note=row["note"], actor=actor, log=False)
+                    self.link(a_id, row["b"], type=row["type"], weight=row["weight"],
+                              note=row["note"], actor=actor, log=False)
                 except ValueError:
                     pass
         self.x("UPDATE memories SET status='superseded', merged_into=?, updated_at=? WHERE id=?",
@@ -583,10 +609,15 @@ class Store:
         # gentle prior: important memories surface first, recency breaks ties
         age_days = max(0.0, (now - memory["created_at"]) / 86400.0)
         recency = math.exp(-age_days / 45.0)
+        if terms and base <= 0.0:
+            # nothing matched: the recency prior must not invent a match, or every
+            # young memory answers every query ("walrus operator" -> banana bread)
+            return 0.0
         return base * (0.55 + memory["importance"]) + recency * (0.35 if not terms else 0.08)
 
     def search(self, query: str, limit: int = 40, include_archived: bool = False) -> list[dict]:
         now = _now()
+        limit = _limit(limit, 40)
         terms = tokenize(query)
         rows = []
         for memory in self.map_memories(include_archived):
@@ -602,10 +633,14 @@ class Store:
     def recall(self, query: str, limit: int = 8, actor: str = "agent", record: bool = True) -> list[dict]:
         """Agent-facing retrieval: ranked results + a retrieval trace."""
         started = time.perf_counter()
+        limit = _limit(limit, 8)
         results = self.search(query, limit=limit * 3)
         # memories the agent already knows get a small boost (exposure matters)
         for r in results:
             r["score"] *= 1.0 + min(0.35, r["access_count"] * 0.06)
+        # the boost changes the order, so the order has to be taken again --
+        # otherwise results come back unsorted and `limit` cuts the wrong ones
+        results.sort(key=lambda m: -m["score"])
         results = results[:limit]
         duration = int((time.perf_counter() - started) * 1000)
         if record:
@@ -681,6 +716,7 @@ class Store:
         return entry
 
     def recent_activity(self, limit: int = 80, since: float | None = None) -> list[dict]:
+        limit = _limit(limit, 80, 1000)
         if since is not None:
             rows = self.q(
                 "SELECT * FROM activity WHERE ts > ? ORDER BY ts DESC LIMIT ?", (since, limit)
@@ -694,7 +730,6 @@ class Store:
         now = _now()
         ages = [(now - m["created_at"]) / 86400.0 for m in memories]
         nodes = self.map_nodes()
-        last_week = now - 7 * 86400
         return {
             "memories": len(memories),
             "archived": self.q("SELECT COUNT(*) c FROM memories WHERE status<>'active'")[0]["c"],
@@ -853,50 +888,69 @@ class Store:
 
             now = _now()
             conn = self._connect()
-            if replace:
-                # kv holds the *old* tree's identity. Leaving it behind points the
-                # interface at a root node that this import just deleted.
-                conn.executescript("DELETE FROM nodes; DELETE FROM memories; "
-                                   "DELETE FROM links; DELETE FROM kv;")
-            for raw in raw_nodes:
-                conn.execute(
-                    """INSERT OR REPLACE INTO nodes(id,parent_id,name,kind,summary,hue,depth,memory_id,
-                                                   collapsed,pinned,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (raw["id"], raw.get("parent_id"), raw.get("name", "untitled"),
-                     raw.get("kind", "branch"), raw.get("summary", ""), raw.get("hue", 265),
-                     raw.get("depth", 0), raw.get("memory_id"), int(raw.get("collapsed", 0)),
-                     int(raw.get("pinned", 0)), raw.get("created_at", now), now),
-                )
-            for raw in raw_memories:
-                conn.execute(
-                    """INSERT OR REPLACE INTO memories(id,node_id,title,content,kind,domain,tags,
-                           importance,confidence,source,created_at,updated_at,accessed_at,
-                           access_count,version,status,merged_into)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (raw["id"], raw.get("node_id"), raw.get("title", "untitled"),
-                     raw.get("content", ""), raw.get("kind", "fact"), raw.get("domain", ""),
-                     json.dumps(raw.get("tags", [])), raw.get("importance", 0.5),
-                     raw.get("confidence", 0.7), raw.get("source", "agent"),
-                     raw.get("created_at", now), raw.get("updated_at", now),
-                     raw.get("accessed_at"), raw.get("access_count", 0), raw.get("version", 1),
-                     raw.get("status", "active"), raw.get("merged_into")),
-                )
-            for raw in raw_links:
-                a, b = _pair(raw["a"], raw["b"])
-                conn.execute(
-                    "INSERT OR REPLACE INTO links(id,a,b,type,weight,note,created_at) VALUES(?,?,?,?,?,?,?)",
-                    (raw.get("id", new_id("lnk")), a, b, raw.get("type", "related"),
-                     raw.get("weight", 0.6), raw.get("note", ""), raw.get("created_at", now)),
-                )
-            meta = payload.get("meta") or {}
-            self.kv_set("meta", meta)
-            # never leave root_id pointing at a node this import did not create
-            wanted = meta.get("root_id")
-            self.kv_set("root_id", wanted if wanted in node_ids else root_id)
-            if meta.get("agent"):
-                self.kv_set("agent_name", meta["agent"])
-            conn.commit()
+            # One transaction for the whole import. kv_set() commits on every
+            # statement, so a failure part-way through used to leave a database
+            # holding some of the new tree and some of the old.
+            try:
+                if replace:
+                    # kv holds the *old* tree's identity. Leaving it behind points the
+                    # interface at a root node that this import just deleted.
+                    for stmt in ("DELETE FROM nodes", "DELETE FROM memories", "DELETE FROM links"):
+                        conn.execute(stmt)
+                    # same rule as forget(hard=True): keep the audit rows and their
+                    # text, drop the ids that this import is about to invalidate
+                    conn.execute("UPDATE activity SET memory_id=NULL, node_id=NULL "
+                                 "WHERE memory_id IS NOT NULL OR node_id IS NOT NULL")
+                    conn.execute("DELETE FROM kv")
+                for raw in raw_nodes:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO nodes(id,parent_id,name,kind,summary,hue,depth,
+                               memory_id,collapsed,pinned,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (raw["id"], raw.get("parent_id"), raw.get("name", "untitled"),
+                         raw.get("kind", "branch"), raw.get("summary", ""), raw.get("hue", 265),
+                         raw.get("depth", 0), raw.get("memory_id"), int(raw.get("collapsed", 0)),
+                         int(raw.get("pinned", 0)), raw.get("created_at", now), now),
+                    )
+                for raw in raw_memories:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO memories(id,node_id,title,content,kind,domain,tags,
+                               importance,confidence,source,created_at,updated_at,accessed_at,
+                               access_count,version,status,merged_into)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (raw["id"], raw.get("node_id"), raw.get("title", "untitled"),
+                         raw.get("content", ""), raw.get("kind", "fact"), raw.get("domain", ""),
+                         json.dumps(raw.get("tags", [])), raw.get("importance", 0.5),
+                         raw.get("confidence", 0.7), raw.get("source", "agent"),
+                         raw.get("created_at", now), raw.get("updated_at", now),
+                         raw.get("accessed_at"), raw.get("access_count", 0), raw.get("version", 1),
+                         raw.get("status", "active"), raw.get("merged_into")),
+                    )
+                for raw in raw_links:
+                    a, b = _pair(raw["a"], raw["b"])
+                    conn.execute(
+                        "INSERT OR REPLACE INTO links(id,a,b,type,weight,note,created_at)"
+                        " VALUES(?,?,?,?,?,?,?)",
+                        (raw.get("id", new_id("lnk")), a, b, raw.get("type", "related"),
+                         raw.get("weight", 0.6), raw.get("note", ""), raw.get("created_at", now)),
+                    )
+                meta = payload.get("meta") or {}
+                # never leave root_id pointing at a node this import did not create
+                wanted = meta.get("root_id")
+                entries = [("meta", meta),
+                           ("root_id", wanted if wanted in node_ids else root_id)]
+                if meta.get("agent"):
+                    entries.append(("agent_name", meta["agent"]))
+                for key, value in entries:
+                    conn.execute(
+                        "INSERT INTO kv(key,value) VALUES(?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, json.dumps(value)),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         self._mirror()
         return {"nodes": len(raw_nodes), "memories": len(raw_memories),
                 "links": len(raw_links), "repaired": repaired}

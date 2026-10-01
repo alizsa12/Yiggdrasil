@@ -246,8 +246,10 @@ Design notes worth keeping:
   the node positions, so they all have to pass through the same transform. Skip
   that and the wood and the neurons it feeds end up in two different coordinate
   systems — neurons float away from their own branches, and the tree draws at
-  half the size it was grown at. `worstVeinGap` (the distance between a vein's
-  end and the node it feeds) must stay at zero.
+  half the size it was grown at. The invariant to hold: every capillary ends on
+  the node it feeds, so the gap between a capillary's last point and its node is
+  zero. Nothing asserts this — it is a rendering invariant, so check it in the
+  browser after touching `normalise()`.
 - **Scale is the hierarchy.** Bole radius ≈ 1.8× the radius of an entire realm.
   A neuron is a couple of pixels from the establishing distance and a cell once
   you are inside its world. If the memories look big, the tree is too small.
