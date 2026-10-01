@@ -618,7 +618,7 @@ class Store:
             )
             for r in results:  # reinforce what was actually surfaced
                 self.x(
-                    "UPDATE memories SET accessed_at=COALESCE(accessed_at,?), access_count=access_count+1 WHERE id=?",
+                    "UPDATE memories SET accessed_at=?, access_count=access_count+1 WHERE id=?",
                     (_now(), r["id"]),
                 )
         return results
@@ -796,43 +796,94 @@ class Store:
 
     # ------------------------------------------------------------------ import
     def load_payload(self, payload: dict, replace: bool = False) -> dict:
+        """Import an export payload, repairing every reference it carries.
+
+        Ids are minted for anything that arrived without one, and every id-shaped
+        reference is checked against the set that will actually exist afterwards:
+        a node's memory_id, a memory's node_id and merged_into, and both ends of
+        a link. A payload from export() needs none of this, but a partial or
+        hand-written one used to import happily and leave pointers to nothing.
+        """
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
-        id_map: dict[str, str] = {}
-        now = _now()
+
+        raw_nodes = [dict(r) for r in payload.get("nodes", [])]
+        raw_memories = [dict(r) for r in payload.get("memories", [])]
+        for raw in raw_nodes:
+            raw["id"] = raw.get("id") or new_id("nd")
+        for raw in raw_memories:
+            raw["id"] = raw.get("id") or new_id("mem")
+
+        node_ids = {r["id"] for r in raw_nodes}
+        memory_ids = {r["id"] for r in raw_memories}
+        # a graft target for memories whose branch went missing in the payload
+        root_id = (next((r["id"] for r in raw_nodes if r.get("kind") == "root"), None)
+                   or next((r["id"] for r in raw_nodes if not r.get("parent_id")), None))
+
         with self._lock:
+            # merging into an existing tree: ids already there are legitimate targets
+            known_nodes = set() if replace else {r["id"] for r in self.q("SELECT id FROM nodes")}
+            known_memories = (set() if replace
+                              else {r["id"] for r in self.q("SELECT id FROM memories")})
+            resolvable_nodes = known_nodes | node_ids
+            resolvable_memories = known_memories | memory_ids
+
+            repaired = {"parent": 0, "node_memory": 0, "memory_node": 0, "merged_into": 0, "links": 0}
+            for raw in raw_nodes:
+                if raw.get("parent_id") not in resolvable_nodes:
+                    raw["parent_id"] = None
+                    repaired["parent"] += 1
+                # a branch carrying no memory is legal; a memory_id pointing nowhere is not
+                if raw.get("memory_id") and raw["memory_id"] not in resolvable_memories:
+                    raw["memory_id"] = None
+                    repaired["node_memory"] += 1
+            for raw in raw_memories:
+                if raw.get("node_id") not in resolvable_nodes:
+                    raw["node_id"] = root_id or raw.get("node_id")
+                    repaired["memory_node"] += 1
+                if raw.get("merged_into") and raw["merged_into"] not in resolvable_memories:
+                    raw["merged_into"] = None
+                    repaired["merged_into"] += 1
+            raw_links = []
+            for raw in payload.get("links", []):
+                if raw.get("a") in resolvable_memories and raw.get("b") in resolvable_memories:
+                    raw_links.append(raw)
+                else:
+                    repaired["links"] += 1
+
+            now = _now()
             conn = self._connect()
             if replace:
-                conn.executescript("DELETE FROM nodes; DELETE FROM memories; DELETE FROM links;")
-            for raw in payload.get("nodes", []):
-                nid = raw.get("id") or new_id("nd")
-                id_map[raw.get("id", nid)] = nid
-            for raw in payload.get("nodes", []):
-                parent = id_map.get(raw.get("parent_id"), raw.get("parent_id"))
+                # kv holds the *old* tree's identity. Leaving it behind points the
+                # interface at a root node that this import just deleted.
+                conn.executescript("DELETE FROM nodes; DELETE FROM memories; "
+                                   "DELETE FROM links; DELETE FROM kv;")
+            for raw in raw_nodes:
                 conn.execute(
                     """INSERT OR REPLACE INTO nodes(id,parent_id,name,kind,summary,hue,depth,memory_id,
                                                    collapsed,pinned,created_at,updated_at)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (id_map.get(raw["id"], raw["id"]), parent, raw.get("name", "untitled"),
+                    (raw["id"], raw.get("parent_id"), raw.get("name", "untitled"),
                      raw.get("kind", "branch"), raw.get("summary", ""), raw.get("hue", 265),
                      raw.get("depth", 0), raw.get("memory_id"), int(raw.get("collapsed", 0)),
                      int(raw.get("pinned", 0)), raw.get("created_at", now), now),
                 )
-            for raw in payload.get("memories", []):
+            for raw in raw_memories:
                 conn.execute(
                     """INSERT OR REPLACE INTO memories(id,node_id,title,content,kind,domain,tags,
                            importance,confidence,source,created_at,updated_at,accessed_at,
                            access_count,version,status,merged_into)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (raw["id"], id_map.get(raw.get("node_id"), raw.get("node_id")),
-                     raw.get("title", "untitled"), raw.get("content", ""), raw.get("kind", "fact"),
-                     raw.get("domain", ""), json.dumps(raw.get("tags", [])), raw.get("importance", 0.5),
-                     raw.get("confidence", 0.7), raw.get("source", "agent"), raw.get("created_at", now),
-                     raw.get("updated_at", now), raw.get("accessed_at"), raw.get("access_count", 0),
-                     raw.get("version", 1), raw.get("status", "active"), raw.get("merged_into")),
+                    (raw["id"], raw.get("node_id"), raw.get("title", "untitled"),
+                     raw.get("content", ""), raw.get("kind", "fact"), raw.get("domain", ""),
+                     json.dumps(raw.get("tags", [])), raw.get("importance", 0.5),
+                     raw.get("confidence", 0.7), raw.get("source", "agent"),
+                     raw.get("created_at", now), raw.get("updated_at", now),
+                     raw.get("accessed_at"), raw.get("access_count", 0), raw.get("version", 1),
+                     raw.get("status", "active"), raw.get("merged_into")),
                 )
-            for raw in payload.get("links", []):
-                a, b = _pair(id_map.get(raw["a"], raw["a"]), id_map.get(raw["b"], raw["b"]))
+            for raw in raw_links:
+                a, b = _pair(raw["a"], raw["b"])
                 conn.execute(
                     "INSERT OR REPLACE INTO links(id,a,b,type,weight,note,created_at) VALUES(?,?,?,?,?,?,?)",
                     (raw.get("id", new_id("lnk")), a, b, raw.get("type", "related"),
@@ -840,11 +891,15 @@ class Store:
                 )
             meta = payload.get("meta") or {}
             self.kv_set("meta", meta)
-            if meta.get("root_id"):
-                self.kv_set("root_id", id_map.get(meta["root_id"], meta["root_id"]))
+            # never leave root_id pointing at a node this import did not create
+            wanted = meta.get("root_id")
+            self.kv_set("root_id", wanted if wanted in node_ids else root_id)
+            if meta.get("agent"):
+                self.kv_set("agent_name", meta["agent"])
             conn.commit()
         self._mirror()
-        return {"nodes": len(payload.get("nodes", [])), "memories": len(payload.get("memories", []))}
+        return {"nodes": len(raw_nodes), "memories": len(raw_memories),
+                "links": len(raw_links), "repaired": repaired}
 
     def close(self) -> None:
         with self._lock:

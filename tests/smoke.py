@@ -122,6 +122,67 @@ def main():
     check("export/import round-trips", len(fresh.map_memories()) == len(store.map_memories()))
     check("import keeps links", len(fresh.map_links()) == len(store.map_links()))
 
+    print("\nimport integrity")
+    foreign = Store(os.path.join(tmp, "foreign.db"), None)
+    seed_mod.seed(foreign)
+    old_agent, old_root = foreign.kv_get("agent_name"), foreign.kv_get("root_id")
+    foreign.load_payload(
+        {"nodes": [{"id": "nd_new_root", "parent_id": None, "name": "Foreign", "kind": "root", "depth": 0}],
+         "memories": [], "links": []}, replace=True)
+    fnodes = {n["id"] for n in foreign.map_nodes()}
+    check("a replaced tree inherits no stale root",
+          foreign.kv_get("root_id") in fnodes, (old_root, foreign.kv_get("root_id")))
+    check("a replaced tree inherits no stale agent identity",
+          foreign.kv_get("agent_name") != old_agent, (old_agent, foreign.kv_get("agent_name")))
+
+    hostile = {
+        "meta": {"root_id": "nd_gone"},          # points at a node the payload lacks
+        "nodes": [
+            {"id": "nd_root", "parent_id": "nd_ghost", "name": "Root", "kind": "root", "depth": 0},
+            {"parent_id": "nd_root", "name": "No id at all", "kind": "branch"},   # no id -> minted
+            {"id": "nd_leaf", "parent_id": "nd_root", "name": "Leaf", "kind": "leaf",
+             "memory_id": "mem_absent"},          # points at a memory the payload lacks
+        ],
+        "memories": [
+            {"id": "mem_orphan", "node_id": "nd_absent", "title": "Orphan"},   # branch missing
+            {"id": "mem_ghost", "node_id": "nd_root", "title": "Superseded",
+             "status": "superseded", "merged_into": "mem_absent"},             # target missing
+            {"id": "mem_fine", "node_id": "nd_root", "title": "Fine"},
+        ],
+        "links": [{"id": "lnk_1", "a": "mem_fine", "b": "mem_absent"}],        # endpoint missing
+    }
+    h = Store(os.path.join(tmp, "h.db"), None)
+    report = h.load_payload(hostile, replace=True)
+    hnodes = {n["id"] for n in h.map_nodes()}
+    hmem = {m["id"]: m for m in h.map_memories(include_archived=True)}
+    check("import mints ids for entries that lack one",
+          len(h.map_nodes()) == 3 and report["nodes"] == 3, report)
+    check("no node points at a missing parent",
+          all(n["parent_id"] in hnodes for n in h.map_nodes() if n["parent_id"]))
+    check("no node points at a missing memory",
+          all(not n.get("memory_id") or n["memory_id"] in hmem for n in h.map_nodes()))
+    check("no memory points at a missing node",
+          all(m["node_id"] in hnodes for m in hmem.values()), report)
+    check("no memory points at a missing merged_into",
+          all(not m.get("merged_into") or m["merged_into"] in hmem for m in hmem.values()))
+    check("links to missing memories are dropped, not kept dangling",
+          all(l["a"] in hmem and l["b"] in hmem for l in h.map_links()) and not h.map_links(),
+          report["repaired"])
+    check("the grafted orphan memory is still readable", hmem["mem_orphan"]["node_id"] in hnodes)
+    check("root_id is resolved against what was imported",
+          h.kv_get("root_id") in hnodes, h.kv_get("root_id"))
+
+    print("\nrecency")
+    store.recall("pruning pass", limit=3)
+    time.sleep(0.05)
+    surfaced = [m["id"] for m in store.recall("pruning pass", limit=3)]
+    seen = {mid: store.memory(mid)["accessed_at"] for mid in surfaced}
+    time.sleep(0.05)
+    store.recall("pruning pass", limit=3)
+    check("accessed_at tracks the latest access, not the first",
+          bool(surfaced) and all(store.memory(mid)["accessed_at"] > seen[mid] for mid in surfaced),
+          [(mid, seen[mid], store.memory(mid)["accessed_at"]) for mid in surfaced])
+
     print("\ncollapse")
     domain = store.q("SELECT * FROM nodes WHERE kind='domain' LIMIT 1")[0]
     below = [r["id"] for r in store.q("SELECT id FROM nodes WHERE parent_id=?", (domain["id"],))]
