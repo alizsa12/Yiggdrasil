@@ -1,0 +1,4 @@
+{
+  "//": "Marks web/js/*.js as ES modules for Node so the agent modules can be imported directly by tests/smoke-agent.mjs. Browsers and the Python static server are unaffected.",
+  "type": "module"
+}

@@ -9,6 +9,10 @@ import { YggdrasilEngine } from './engine.js';
 import { TimelineView } from './timeline.js';
 import { GraphView } from './graph.js';
 import {
+  ensureAgentWorld, syncAgentWorld, getAgentWorld, spawnAgent, configureModel,
+  startLoop, stopLoop, toggleDebug, renderDebug, focusAgent, stepAgents,
+} from './agent-control.js';
+import {
   $, $$, api, clamp, debounce, el, fmtDate, fmtDuration, fmtNum,
   fmtRelative, hsl, pct, truncate,
 } from './util.js';
@@ -77,7 +81,29 @@ async function boot() {
   connectStream();
   bindChrome();
   // a small handle for the console: inspect the canopy from a devtools session
-  window.ygg = { get state() { return snapshot; }, engine, timeline, graph, selectMemory, runSearch };
+  window.ygg = {
+    get state() { return snapshot; },
+    engine,
+    timeline,
+    graph,
+    selectMemory,
+    runSearch,
+    // the agent world: spawn a body in the tree and let a model walk it
+    agents: {
+      get world() { return getAgentWorld(); },
+      spawn: (options) => spawnAgent(options),
+      model: (config) => configureModel(config),
+      step: (times) => stepAgents(times),
+      start: (ms) => startLoop(ms),
+      stop: () => stopLoop(),
+      debug: (on) => toggleDebug(on),
+      focus: (id) => focusAgent(id),
+      refresh: () => { renderDebug(); return getAgentWorld()?.debug(); },
+    },
+  };
+  // an agent world exists from the start so the debug handle always works; it
+  // is empty until something spawns, and costs nothing while empty
+  ensureAgentWorld(engine, snapshot);
   setTimeout(() => $('#boot').classList.add('done'), 260);
 }
 
@@ -126,6 +152,9 @@ function applySnapshotNow(next) {
   engine.setState(next);
   timeline.setState(next);
   graph.setState(next);
+  // the agent world draws from the same snapshot the renderer does, so an agent
+  // walking in the world sees the tree as it is now, not as it was
+  syncAgentWorld(engine, next);
   renderStats();
   renderDomains();
   renderActivity();

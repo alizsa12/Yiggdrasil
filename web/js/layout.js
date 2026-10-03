@@ -18,6 +18,7 @@
 import {
   GOLDEN, TAU, add, basis, cross, dist, dot, mix3, mul, norm, rnd, sub, clamp,
 } from './util.js';
+import { buildWorld } from './world.js';
 
 /** segment length by depth: a long trunk tapering into the canopy */
 const SEGMENT = [58, 52, 40, 30, 22, 15, 11];
@@ -34,70 +35,6 @@ const THICKNESS = [19, 5.2, 3.4, 2.2, 1.4, 0.9, 0.6];
 
 /** the buttress roots that hold the tree up */
 const ROOT_COUNT = 6;
-
-/**
- * What each realm actually *is*, as a place. Nine realms from Grímnismál are
- * not nine tints of the same room: one is a citadel of gold, one is a frozen
- * plain, one is the well at the root of the tree, one is the yawning nothing
- * before there was anything. Entering a realm should feel like arriving
- * somewhere, so each carries its own ground, sky, air and landmarks.
- */
-const WORLDS = {
-  // the citadel of the Aesir: ordered, gilded, monumental
-  asgard: {
-    ground: 'marble', groundHue: 46, groundLight: 30,
-    sky: [48, 22, 8], haze: [46, 72, 0.05], motes: 'dust',
-    motifs: ['rampart', 'pillar', 'hall'], landmark: 'hall',
-  },
-  // the green, gentle land of the Vanir: water, growth, soft light
-  vanheim: {
-    ground: 'water', groundHue: 88, groundLight: 22,
-    sky: [96, 30, 10], haze: [92, 55, 0.07], motes: 'pollen',
-    motifs: ['islet', 'willow', 'reed'], landmark: 'islet',
-  },
-  // the land of the giants: basalt, scale, embers, weather
-  jotun: {
-    ground: 'basalt', groundHue: 26, groundLight: 14,
-    sky: [22, 30, 6], haze: [20, 60, 0.08], motes: 'ember',
-    motifs: ['monolith', 'crag', 'bridge'], landmark: 'monolith',
-  },
-  // the well of wisdom: still water, deep, echoing
-  mimame: {
-    ground: 'water', groundHue: 40, groundLight: 18,
-    sky: [200, 26, 6], haze: [196, 48, 0.09], motes: 'dust',
-    motifs: ['well', 'stair', 'arch'], landmark: 'well',
-  },
-  // the cold road: ice, bare rock, no shelter
-  hel: {
-    ground: 'ice', groundHue: 196, groundLight: 42,
-    sky: [204, 34, 12], haze: [202, 60, 0.06], motes: 'frost',
-    motifs: ['shard', 'obelisk', 'cairn'], landmark: 'obelisk',
-  },
-  // the dark elves: under the mountain, metal, forges, no sky
-  svartalf: {
-    ground: 'basalt', groundHue: 32, groundLight: 11,
-    sky: [30, 18, 4], haze: [28, 55, 0.11], motes: 'ember',
-    motifs: ['forge', 'pillar', 'vein'], landmark: 'forge',
-  },
-  // the wide wind: open air, cloud, nothing to stand on but towers
-  audr: {
-    ground: 'cloud', groundHue: 44, groundLight: 34,
-    sky: [40, 20, 12], haze: [42, 40, 0.13], motes: 'pollen',
-    motifs: ['tower', 'vane', 'cloudbank'], landmark: 'tower',
-  },
-  // mist and temperament: formless, cold, nothing resolved
-  nifl: {
-    ground: 'mist', groundHue: 210, groundLight: 24,
-    sky: [212, 16, 5], haze: [214, 30, 0.16], motes: 'frost',
-    motifs: ['cairn', 'veil'], landmark: 'cairn',
-  },
-  // the yawning gap: the abyss before creation, lit by two opposed rivers
-  ginnung: {
-    ground: 'void', groundHue: 268, groundLight: 8,
-    sky: [266, 30, 4], haze: [264, 62, 0.07], motes: 'star',
-    motifs: ['rift', 'river'], landmark: 'rift',
-  },
-};
 
 const segLength = (depth) => SEGMENT[Math.min(depth, SEGMENT.length - 1)];
 const clusterRadius = (depth) => (13 - Math.min(depth, 5) * 1.5);
@@ -388,11 +325,28 @@ function buildRealms({ nodes, byId, children, pos, memoryByNode, maxWeight }) {
     for (let i = 0; i < count; i++) {
       const a = (i / count) * TAU + rnd(domain.id, `sa${i}`) * 0.9;
       const tilt = 0.25 + rnd(domain.id, `st${i}`) * 1.0;
-      const axis = norm([Math.cos(a) * Math.cos(tilt), Math.sin(tilt) * 0.55, Math.sin(a) * Math.cos(tilt)]);
-      const length = radius * (1.5 + rnd(domain.id, `sl${i}`) * 0.85);
-      const mid = add(center, mul(axis, length * (rnd(domain.id, `so${i}`) - 0.35) * 0.5));
+      // Tangential, not radial, and barely inclined. Steeply raked boughs span
+      // more than a realm-radius of height along their own length and throw
+      // their far end out of frame; radial ones all meet in the middle and
+      // become one rosette instead of a canopy.
+      const axis = norm([-Math.sin(a) * Math.cos(tilt), Math.sin(tilt) * 0.2, Math.cos(a) * Math.cos(tilt)]);
+      const length = radius * (1.0 + rnd(domain.id, `sl${i}`) * 0.5);
+      // Staggered around a ring above the country, each at its own height, so
+      // the wood reads as branches over a landscape with daylight between them
+      // — and so the memories grown into it are spread across the world rather
+      // than piled in the middle of it.
+      const arch = radius * (0.08 + rnd(domain.id, `sh${i}`) * 0.36);
+      const ring = radius * (0.3 + rnd(domain.id, `sr${i}`) * 0.12);
+      const mid = [
+        center[0] + Math.cos(a) * ring,
+        center[1] + arch,
+        center[2] + Math.sin(a) * ring,
+      ];
       const [bu, bv] = basis(axis);
-      const thick = radius * (0.05 + rnd(domain.id, `sk${i}`) * 0.075);
+      // Slim. A bough that crosses a realm is a *branch over a country*, and
+      // the country is the subject: at half this width five of them close up
+      // into a wall of wood with the world hidden behind it.
+      const thick = radius * (0.02 + rnd(domain.id, `sk${i}`) * 0.018);
       const points = [];
       for (let s = 0; s <= 14; s++) {
         const t = s / 14;
@@ -413,7 +367,9 @@ function buildRealms({ nodes, byId, children, pos, memoryByNode, maxWeight }) {
       const [iu, iv] = basis(structure.axis);
       const spin = rnd(nodeId, 'ispin') * TAU;
       const outwardVessel = add(mul(iu, Math.cos(spin)), mul(iv, Math.sin(spin)));
-      const lift = structure.thick * 0.5 + radius * 0.06 + rnd(nodeId, 'ilift') * radius * 0.13;
+      // a cell is *in* the wood, not hovering beside it: the lift is a small
+      // multiple of the bough's own radius
+      const lift = structure.thick * 0.5 + radius * 0.012 + rnd(nodeId, 'ilift') * radius * 0.03;
       innerPos.set(nodeId, add(add(along, mul(outwardVessel, lift)), mul(structure.axis, (rnd(nodeId, 'ialong') - 0.5) * 2)));
     });
 
@@ -428,7 +384,9 @@ function buildRealms({ nodes, byId, children, pos, memoryByNode, maxWeight }) {
       members,
       innerPos,
       tip,
-      world: worldFor(domain, radius),
+      // what the realm is *as a place* — its landform, regions, landmarks,
+      // routes and weather. See world.js.
+      world: buildWorld(domain, radius),
     });
   }
 
@@ -475,30 +433,6 @@ function normalise(pos) {
  * landmarks that make it recognisable. Positions are generated here, in the
  * realm's own space, so the renderer only has to draw them.
  */
-function worldFor(domain, radius) {
-  const key = domain.id || '';
-  const preset = WORLDS[key.replace(/^nd_/, '')] || WORLDS.asgard;
-  const floor = radius * 0.78;
-  const motifs = [];
-  for (const kind of preset.motifs) {
-    const count = kind === 'landmark' ? 1 : (2 + Math.round(rnd(key, `mc${kind}`) * 2));
-    for (let i = 0; i < count; i++) {
-      const a = (i / count) * TAU + rnd(key, `ma${kind}${i}`) * 1.1;
-      const d = radius * (kind === 'landmark' ? 0.42 : 0.5 + rnd(key, `md${kind}${i}`) * 0.62);
-      const h = radius * (kind === 'landmark'
-        ? 1.5 + rnd(key, `mh${kind}${i}`) * 0.8
-        : 0.4 + rnd(key, `mh${kind}${i}`) * 1.1);
-      motifs.push({
-        kind,
-        pos: [Math.cos(a) * d, -floor + h * 0.5, Math.sin(a) * d],
-        height: h,
-        width: radius * (kind === 'landmark' ? 0.2 : 0.05 + rnd(key, `mw${kind}${i}`) * 0.12),
-        spin: rnd(key, `ms${kind}${i}`) * TAU,
-      });
-    }
-  }
-  return { ...preset, radius, floor, motifs };
-}
 
 /**
  * The bole: the trunk the limbs leave from. Drawn as wood in its own right,

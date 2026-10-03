@@ -13,9 +13,19 @@
 import {
   TAU, add, clamp, cross, dot, easeOutCubic, hsl, lerp, mix3, mul, norm, rnd, sub, basis, dist,
 } from './util.js';
+import { TIERS, tierFor, groundAt, instances } from './world.js';
 
 const SPRITE_SIZE = 128;
 const spriteCache = new Map();
+
+/** per-realm air, keyed by the `motes` field a realm's theme declares */
+const MOTES = {
+  dust: { hue: 40, spread: 20, rise: 0.5, alpha: 0.4, speed: 0.35 },
+  pollen: { hue: 84, spread: 16, rise: 0.28, alpha: 0.46, speed: 0.3 },
+  ember: { hue: 24, spread: 22, rise: 2.4, alpha: 0.6, speed: 0.9 },
+  frost: { hue: 198, spread: 12, rise: -0.7, alpha: 0.4, speed: 0.5 },
+  star: { hue: 44, spread: 26, rise: 0, alpha: 0.55, speed: 0.1 },
+};
 
 function glowSprite(hue, core = 0.09) {
   const key = `${Math.round(hue / 8) * 8}|${core}`;
@@ -147,10 +157,25 @@ export class Organism {
   }
 
   // ───────────────────────────────────────────────────────────────── motes
+  /**
+   * What the air is full of, per realm. Motes are the cheapest atmosphere there
+   * is, so they carry a lot of a world's identity for almost no cost — but only
+   * if they behave differently: frost falls, embers climb, pollen hangs, dust
+   * drifts. Nine realms with the same drifting specks are one realm.
+   */
+  static MOTES = MOTES;
+
   seedMotes() {
     this.motes = [];
     const realm = this.currentRealm();
-    const count = this.engine.reducedMotion ? 40 : 200;
+    const world = realm?.world;
+    const kind = MOTES[world?.motes] || MOTES.dust;
+    // Inside a realm the land now carries the detail, so the air is thinned
+    // right down: motes are the first thing to make a world look like weather
+    // when it is meant to look like a place.
+    const count = this.engine.reducedMotion
+      ? (realm ? 22 : 40)
+      : (realm ? 74 : 200);
     for (let i = 0; i < count; i++) {
       const spread = realm ? realm.radius * 2.2 : 210;
       this.motes.push({
@@ -158,9 +183,10 @@ export class Organism {
         y: (rnd(`m${i}`, 'y') - 0.5) * spread,
         z: (rnd(`m${i}`, 'z') - 0.5) * spread,
         phase: rnd(`m${i}`, 'p') * TAU,
-        speed: 0.25 + rnd(`m${i}`, 's') * 0.8,
+        speed: kind.speed * (0.6 + rnd(`m${i}`, 's') * 0.9),
         size: 0.4 + rnd(`m${i}`, 'd') * 1.5,
-        hue: realm ? (realm.hue ?? 44) - 6 + rnd(`m${i}`, 'h') * 18 : 34 + rnd(`m${i}`, 'h') * 26,
+        hue: kind.hue + (rnd(`m${i}`, 'h') - 0.5) * kind.spread,
+        kind,
       });
     }
     this.seeded = true;
@@ -172,20 +198,26 @@ export class Organism {
     const origin = realm ? realm.center : [0, 0, 0];
     const sprite = dotSprite(2, 'rgba(255,240,200,0.85)');
     const t = this.engine.time;
-    const rise = realm ? realm.radius * 0.9 : 150;
     const span = realm ? realm.radius * 2.2 : 220;
     for (const mote of this.motes) {
-      const y = ((mote.y + t * mote.speed * 3 + span / 2) % span) - span / 2;
+      const y = ((mote.y + t * mote.speed * mote.kind.rise * 3 + span / 2) % span + span) % span - span / 2;
       const sway = Math.sin(t * 0.4 + mote.phase) * 1.8;
       const world = add(origin, [mote.x + sway, y, mote.z + Math.cos(t * 0.33 + mote.phase) * 1.8]);
       const p = this.engine.project(world);
       if (!p || p.a < 0.04) continue;
-      const size = mote.size * p.s * 0.6;
-      ctx.globalAlpha = 0.45 * p.a * (0.45 + 0.55 * Math.sin(t * 1.2 + mote.phase));
+      // Bounded: a mote is a speck of dust. Scaled by focal/z without a cap it
+      // becomes a hundred-pixel bloom the moment it drifts near the camera, and
+      // a few dozen of those turn the whole world into fog.
+      const size = Math.min(5, mote.size * p.s * 0.6);
+      // twinkle for what hangs, flicker for what burns
+      const beat = mote.kind === 'ember'
+        ? 0.3 + 0.7 * Math.abs(Math.sin(t * 3.1 + mote.phase))
+        : 0.45 + 0.55 * Math.sin(t * 1.2 + mote.phase);
+      ctx.globalAlpha = mote.kind.alpha * p.a * beat;
       ctx.drawImage(sprite, p.x - size, p.y - size, size * 2, size * 2);
     }
     ctx.globalAlpha = 1;
-    void rise;
+    void dt;
   }
 
   // ───────────────────────────────────────────────────────────────── limbs
@@ -208,7 +240,13 @@ export class Organism {
   drawLimb(ctx, points, worldWidth, hue, factor, seed, opts = {}) {
     const screen = this.screenPath(points);
     if (!screen || screen.length < 2) return null;
-    const near = screen[0].z;
+    // Stroke width comes from one reference depth. The first point is the
+    // natural choice for a limb growing outward from the trunk, but the realm's
+    // entry conduit starts at the far tip and *ends* in the middle, so its
+    // first point can be right beside the camera — and focal/z then blows the
+    // limb up into a wall across the world. Callers that know better pass
+    // `refZ`.
+    const near = opts.refZ ?? screen[0].z;
     const scale = this.engine.focal / near;
     const width = Math.max(1.1, worldWidth * scale * (opts.widthScale ?? 1));
     const t = this.engine.time;
@@ -352,26 +390,29 @@ export class Organism {
    * dark around it is what makes it read as *embedded*.
    */
   drawNeuron(ctx, screen, worldRadius, hue, memory, opts = {}) {
-    const { factor = 1, selected = false, hovered = false, matched = false } = opts;
+    const { factor = 1, selected = false, hovered = false, matched = false, compact = false } = opts;
     const importance = memory?.importance ?? 0.5;
     const confidence = memory?.confidence ?? 0.7;
     const pulse = 1 + Math.sin(this.engine.time * (0.5 + importance * 0.8)
       + rnd(opts.seed || 'x', 'b') * TAU) * 0.08;
     const radius = Math.max(1.8, worldRadius * pulse);
 
-    // socket: a hollow in the wood
+    // socket: a hollow in the wood. Inside a realm this is dialled back, or a
+    // dozen memories punch a dozen dark holes in the landscape they sit in.
     ctx.beginPath();
-    ctx.arc(screen.x, screen.y, radius * 2.1, 0, TAU);
-    ctx.fillStyle = `rgba(20,13,7,${0.5 * factor})`;
+    ctx.arc(screen.x, screen.y, radius * (compact ? 1.7 : 2.1), 0, TAU);
+    ctx.fillStyle = `rgba(20,13,7,${(compact ? 0.34 : 0.5) * factor})`;
     ctx.fill();
 
     // dendrites — the neuron's own vascular reach. Length and weight are
     // capped, not proportional: a cell seen close up must still read as a
-    // cell, not as a starburst filling the screen.
-    const count = 4 + Math.round(importance * 5);
+    // cell, not as a starburst filling the screen. Inside a realm the cap is
+    // tighter again, because there the cell is sharing the frame with a world.
+    const reach = compact ? 34 : 86;
+    const count = compact ? 3 + Math.round(importance * 3) : 4 + Math.round(importance * 5);
     for (let i = 0; i < count; i++) {
       const angle = rnd(opts.seed || 'x', `d${i}`) * TAU + i * 2.399;
-      const length = clamp(radius * (2.4 + rnd(opts.seed || 'x', `l${i}`) * 3.2), 5, 86);
+      const length = clamp(radius * (2.4 + rnd(opts.seed || 'x', `l${i}`) * 3.2), 5, reach);
       const end = {
         x: screen.x + Math.cos(angle) * length,
         y: screen.y + Math.sin(angle) * length,
@@ -409,12 +450,12 @@ export class Organism {
     }
 
     // the soma: a lit cell, and a faint membrane around it
-    const halo = clamp(radius * 7, 12, 120);
-    ctx.globalAlpha = (0.1 + confidence * 0.18) * factor;
+    const halo = clamp(radius * 7, 12, compact ? 64 : 120);
+    ctx.globalAlpha = (0.1 + confidence * (compact ? 0.13 : 0.18)) * factor;
     ctx.drawImage(glowSprite(hue), screen.x - halo, screen.y - halo, halo * 2, halo * 2);
     ctx.globalAlpha = 1;
 
-    const core = clamp(radius * 2.3, 3, 34);
+    const core = clamp(radius * 2.3, 3, compact ? 26 : 34);
     ctx.globalAlpha = (0.35 + confidence * 0.3) * factor;
     ctx.drawImage(glowSprite(hue, 0.14), screen.x - core, screen.y - core, core * 2, core * 2);
     ctx.globalAlpha = 1;
@@ -875,9 +916,12 @@ export class Organism {
     const engine = this.engine;
     const realm = this.currentRealm();
     if (!realm) return;
+    // one owner for the tier, decided before anything reads it
+    this.tier = tierFor(engine, realm);
 
     // the shell and the wood inside it are solid, not additive
     ctx.globalCompositeOperation = 'source-over';
+    this.drawUnderRealm(ctx, realm);
     this.drawWorld(ctx, realm);
     this.drawShell(ctx, realm);
 
@@ -888,7 +932,11 @@ export class Organism {
       const t = i / 12;
       points.push(mix3(trunk, realm.center, t));
     }
-    this.drawLimb(ctx, points, 2.2, realm.hue ?? 44, 0.9, `${realm.id}_entry`, { thin: true, pass: 'wood' });
+    this.drawLimb(ctx, points, 1.0, realm.hue ?? 44, 0.9, `${realm.id}_entry`, {
+      thin: true,
+      pass: 'wood',
+      refZ: engine.project(realm.center)?.z,
+    });
 
     // boughs
     for (const structure of realm.structures) {
@@ -898,17 +946,21 @@ export class Organism {
 
     // now the vessels, additively, on top of the wood
     ctx.globalCompositeOperation = 'lighter';
+    const tier = this.tier ?? TIERS.NEAR;
     for (const structure of realm.structures) {
       const pts = structure.points;
       this.drawLimb(ctx, pts, structure.thick, realm.hue ?? 44, 0.95, structure.id, { pass: 'vein' });
-      // fine vessels along each bough
-      for (let i = 2; i < pts.length - 1; i += 2) {
+      // Fine vessels along each bough. These are the first thing to go when
+      // the world is far away: at range they are a haze of ticks laid over the
+      // land, and the land is the reason you came in.
+      if (tier !== TIERS.NEAR) continue;
+      for (let i = 2; i < pts.length - 1; i += 3) {
         const screen = this.screenPath([pts[i], mix3(pts[i], pts[i + 1], 0.5)]);
         if (!screen) continue;
         ctx.beginPath();
         ctx.moveTo(screen[0].x, screen[0].y);
         ctx.lineTo(screen[1].x, screen[1].y);
-        ctx.strokeStyle = hsl(realm.hue, 80, 76, 0.35);
+        ctx.strokeStyle = hsl(realm.hue, 80, 76, 0.26);
         ctx.lineWidth = 0.7;
         ctx.stroke();
       }
@@ -925,7 +977,10 @@ export class Organism {
       const memory = this.layout.memoryByNode.get(nodeId);
       if (!memory) continue;
       const worldRadius = this.layout.radiusOf(nodeId);
-      p.r = clamp(worldRadius * p.s * 0.28, 1.2, 60);
+      // A cell seen from outside the world is a speck on an enormous organism.
+      // Inside its own world it has to share the frame with the place it lives
+      // in, so it is drawn at a size the landscape can be read around.
+      p.r = clamp(worldRadius * p.s * 0.15, 1.2, 26);
       neurons.push({ id: nodeId, p, memory, hue: node?.hue ?? realm.hue ?? 44 });
     }
     neurons.sort((a, b) => b.p.z - a.p.z);
@@ -939,90 +994,708 @@ export class Organism {
         hovered: engine.hovered === neuron.id,
         matched: engine.matches.has(memory.id),
         seed: neuron.id,
+        compact: true,
       });
     }
   }
 
   /**
-   * The world a realm is a place in. Each of the nine has its own ground, air
-   * and landmarks, so arriving somewhere reads as arriving *there* rather than
-   * as the same room with a different tint.
+   * The world a realm is a place in.
+   *
+   * Drawn in the order a place is actually made: the air, then the far country
+   * beyond the horizon, then the land, then what stands on the land, then the
+   * weather. Everything the realm generates is already in world space and
+   * already sorted far-to-near, so a frame is a handful of linear passes rather
+   * than a scene graph.
+   *
+   * The detail of all of this is tiered. Arriving in a realm is the fine tier,
+   * because that is when you came for it; backing away drops the ground to a
+   * flat suggestion and stops generating small objects altogether.
    */
   drawWorld(ctx, realm) {
-    const engine = this.engine;
     const world = realm.world;
     if (!world) return;
-    const c = realm.center;
-    const R = realm.radius;
+    const engine = this.engine;
+    const tier = this.tier ?? tierFor(engine, realm);
+    const stats = { tier, cells: 0, landmarks: 0, detail: 0, ms: 0 };
+    this.stats = stats;
+    const started = performance.now();
 
-    // the air of the place: a dark backdrop that gives the realm its colour,
-    // so the neurons stay the brightest thing in the frame
-    const p = engine.project(c);
-    if (p) {
-      // keep the world inside its own shell: a realm is a small sphere hanging
-      // off a branch, and seeing the dark around it is what sells that
-      const px = R * 1.12 * p.s;
-      const sky = ctx.createRadialGradient(p.x, p.y - px * 0.18, px * 0.08, p.x, p.y, px);
-      const [sh, ss] = world.sky;
-      sky.addColorStop(0, hsl(sh, ss, 20, 0.34));
-      sky.addColorStop(0.5, hsl(sh, ss * 0.9, 9, 0.66));
-      sky.addColorStop(1, hsl(sh, ss * 0.7, 3, 0.9));
-      ctx.fillStyle = sky;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, px, 0, TAU);
-      ctx.fill();
-      const [hh, hs, ha] = world.haze;
-      const haze = ctx.createRadialGradient(p.x, p.y, px * 0.12, p.x, p.y, px * 0.95);
-      haze.addColorStop(0, hsl(hh, hs, 48, ha * 0.8));
-      haze.addColorStop(0.7, hsl(hh, hs, 32, ha * 0.34));
-      haze.addColorStop(1, hsl(hh, hs, 20, 0));
-      ctx.fillStyle = haze;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, px * 0.95, 0, TAU);
-      ctx.fill();
-      // the edge of the world itself
+    this.drawAir(ctx, realm, tier);
+    if (tier === TIERS.FAR) this.drawFarGround(ctx, realm, tier);
+    else this.drawTerrain(ctx, realm, tier, stats);
+    this.drawRoof(ctx, realm, tier);
+    this.drawAtmosphere(ctx, realm, tier, 'back');
+    if (tier !== TIERS.FAR) this.drawPaths(ctx, realm, tier);
+    this.drawPopulation(ctx, realm, tier, stats);
+    this.drawAgents(ctx, realm);
+    this.drawAtmosphere(ctx, realm, tier, 'front');
+
+    stats.ms = performance.now() - started;
+  }
+
+  /**
+   * The air of the place. A realm is a small sphere hanging off a branch, and
+   * seeing the dark around it is half of what sells it — so the backdrop stays
+   * bounded, dark, and lower in value than the wood.
+   */
+  drawAir(ctx, realm, tier) {
+    const engine = this.engine;
+    const world = realm.world;
+    const R = realm.radius;
+    const p = engine.project(realm.center);
+    if (!p) return;
+    const px = R * 1.12 * p.s;
+    const [sh, ss] = world.sky;
+    const sky = ctx.createRadialGradient(p.x, p.y - px * 0.18, px * 0.08, p.x, p.y, px);
+    sky.addColorStop(0, hsl(sh, ss, 20, 0.34));
+    sky.addColorStop(0.5, hsl(sh, ss * 0.9, 9, 0.66));
+    sky.addColorStop(1, hsl(sh, ss * 0.7, 3, 0.9));
+    ctx.fillStyle = sky;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, px, 0, TAU);
+    ctx.fill();
+    const [hh, hs, ha] = world.haze;
+    const haze = ctx.createRadialGradient(p.x, p.y, px * 0.12, p.x, p.y, px * 0.95);
+    haze.addColorStop(0, hsl(hh, hs, 48, ha * 0.8));
+    haze.addColorStop(0.7, hsl(hh, hs, 32, ha * 0.34));
+    haze.addColorStop(1, hsl(hh, hs, 20, 0));
+    ctx.fillStyle = haze;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, px * 0.95, 0, TAU);
+    ctx.fill();
+    this.drawDistance(ctx, realm, px, p);
+    if (tier !== TIERS.FAR) {
       ctx.beginPath();
       ctx.arc(p.x, p.y, px, 0, TAU);
       ctx.strokeStyle = hsl(sh, ss, 52, 0.16);
       ctx.lineWidth = 1.2;
       ctx.stroke();
     }
+  }
 
-    // the ground: a disc on the realm's floor, sized by real projection so it
-    // sits in perspective
+  /**
+   * The country past the horizon. Three soft bands, low in contrast, sitting
+   * just outside the realm's own ground. It costs almost nothing and it is the
+   * difference between a world and a diorama: the land does not stop at the
+   * edge of the shell, it carries on into the haze.
+   */
+  drawDistance(ctx, realm, px, centre) {
+    const world = realm.world;
+    const [hh, hs] = world.haze;
+    const left = centre.x - px * 1.15;
+    const right = centre.x + px * 1.15;
+    const horizon = centre.y + px * 0.06;
+    for (let i = 0; i < 2; i++) {
+      const top = horizon - px * (0.2 + i * 0.12);
+      const bottom = horizon + px * (0.34 + i * 0.16);
+      // a ridge line for the far country, walked across the realm's width
+      const steps = 22;
+      ctx.beginPath();
+      ctx.moveTo(left, bottom);
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps;
+        const jag = Math.sin(t * (4 + i * 3) + i * 2.1) * 0.5
+          + Math.sin(t * (9 - i * 2) + 1.3) * 0.3
+          + rnd(world.salt, `d${i}${s}`) * 0.35;
+        ctx.lineTo(left + (right - left) * t, top + jag * px * 0.07);
+      }
+      ctx.lineTo(right, bottom);
+      ctx.closePath();
+      // Faded at both ends: a hard-edged fill reads as a lump of fog sitting on
+      // the landscape rather than as country going on past the horizon.
+      const g = ctx.createLinearGradient(0, top, 0, bottom);
+      g.addColorStop(0, hsl(hh, hs * 0.5, 28, 0));
+      g.addColorStop(0.4, hsl(hh, hs * 0.5, 26, 0.09 - i * 0.03));
+      g.addColorStop(1, hsl(hh, hs * 0.5, 18, 0));
+      ctx.fillStyle = g;
+      ctx.fill();
+    }
+  }
+
+  /**
+   * The far tier's ground: the flat disc, kept because it is what the
+   * establishing view of a realm has always looked like, and because a
+   * heightfield nobody can resolve is just a more expensive flat disc.
+   */
+  drawFarGround(ctx, realm, tier) {
+    const engine = this.engine;
+    const world = realm.world;
+    const c = realm.center;
+    const R = realm.radius;
     const floorY = c[1] - world.floor;
     const f = engine.project([c[0], floorY, c[2]]);
     const right = engine.project([c[0] + R * 0.92, floorY, c[2]]);
     const far = engine.project([c[0], floorY, c[2] - R * 0.92]);
-    if (f && right && far) {
-      const rx = Math.abs(right.x - f.x);
-      const ry = Math.abs(far.y - f.y);
-      const fade = clamp(f.a ?? 1, 0, 1);
-      const gh = world.groundHue;
-      const gl = world.groundLight;
-      if (world.ground !== 'void' && world.ground !== 'mist') {
-        // the ground sits below the wood in value, so the boughs still read
-        const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, Math.max(rx, ry));
-        g.addColorStop(0, hsl(gh, 44, gl * 0.5, 0.92 * fade));
-        g.addColorStop(0.6, hsl(gh, 40, gl * 0.36, 0.9 * fade));
-        g.addColorStop(1, hsl(gh, 34, gl * 0.2, 0.86 * fade));
-        ctx.fillStyle = g;
-      } else {
-        ctx.fillStyle = hsl(gh, 30, gl * 0.4, world.ground === 'mist' ? 0.34 * fade : 0.9 * fade);
+    if (!f || !right || !far) return;
+    const rx = Math.abs(right.x - f.x);
+    const ry = Math.abs(far.y - f.y);
+    const fade = clamp(f.a ?? 1, 0, 1);
+    const gh = world.groundHue;
+    const gl = world.groundLight;
+    if (world.ground !== 'void' && world.ground !== 'mist') {
+      const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, Math.max(rx, ry));
+      g.addColorStop(0, hsl(gh, 44, gl * 0.5, 0.92 * fade));
+      g.addColorStop(0.6, hsl(gh, 40, gl * 0.36, 0.9 * fade));
+      g.addColorStop(1, hsl(gh, 34, gl * 0.2, 0.86 * fade));
+      ctx.fillStyle = g;
+    } else {
+      ctx.fillStyle = hsl(gh, 30, gl * 0.4, world.ground === 'mist' ? 0.34 * fade : 0.9 * fade);
+    }
+    ctx.beginPath();
+    ctx.ellipse(f.x, f.y, rx, Math.max(ry, rx * 0.06), 0, 0, TAU);
+    ctx.fill();
+    this.groundTexture(ctx, world, f, rx, ry, fade);
+    void tier;
+  }
+
+  /**
+   * The land.
+   *
+   * A polar grid is sampled against the realm's own heightfield, projected, and
+   * filled back-to-front as shaded triangles. Three details do most of the
+   * work: the normal of each triangle is lit by the realm's own sun, a face
+   * whose corners differ sharply in height is painted as exposed rock, and
+   * distant ground loses contrast toward the haze. Cells with no ground are
+   * skipped rather than filled, which is what leaves the dark showing through
+   * under a floating shelf or over the mouth of a well.
+   */
+  drawTerrain(ctx, realm, tier, stats) {
+    const engine = this.engine;
+    const world = realm.world;
+    const c = realm.center;
+    const R = realm.radius;
+    const floorY = c[1] - world.floor;
+    const RINGS = tier === TIERS.NEAR ? 9 : 6;
+    const SECTORS = tier === TIERS.NEAR ? 22 : 13;
+    const rot = rnd(world.salt, 'rot') * TAU;
+    const pal = world.palette;
+
+    const grid = [];
+    for (let i = 0; i <= RINGS; i++) {
+      const fr = Math.pow(i / RINGS, 0.82);
+      const row = [];
+      for (let j = 0; j < SECTORS; j++) {
+        const a = (j / SECTORS) * TAU + rot;
+        const x = Math.cos(a) * fr * R;
+        const z = Math.sin(a) * fr * R;
+        const g = groundAt(world, x, z);
+        if (!g) { row.push(null); continue; }
+        const p = engine.project([c[0] + x, floorY + g.y, c[2] + z]);
+        if (!p) { row.push(null); continue; }
+        row.push({ x, y: g.y, z, sx: p.x, sy: p.y, a: p.a, zc: p.z, region: g.region, water: !!g.region.water });
       }
-      ctx.beginPath();
-      ctx.ellipse(f.x, f.y, rx, Math.max(ry, rx * 0.06), 0, 0, TAU);
-      ctx.fill();
-      this.groundTexture(ctx, world, f, rx, ry, fade);
+      grid.push(row);
     }
 
-    // landmarks, far to near
-    const drawn = world.motifs
-      .map((m) => ({ m, p: engine.project([c[0] + m.pos[0], floorY + m.height * 0.5, c[2] + m.pos[2]]) }))
-      .filter((x) => x.p)
-      .sort((a, b) => b.p.z - a.p.z);
-    for (const { m, p } of drawn) {
-      this.drawMotif(ctx, m, p, floorY, c, engine);
+    // back to front, so a ridge properly hides the ground behind it
+    const faces = [];
+    for (let i = 0; i < RINGS; i++) {
+      for (let j = 0; j < SECTORS; j++) {
+        const v00 = grid[i][j];
+        const v10 = grid[i][j + 1 === SECTORS ? 0 : j + 1];
+        const v01 = grid[i + 1][j];
+        const v11 = grid[i + 1][j + 1 === SECTORS ? 0 : j + 1];
+        if (v00 && v10 && v11) faces.push([v00, v10, v11]);
+        if (v00 && v11 && v01) faces.push([v00, v11, v01]);
+      }
+    }
+    faces.sort((m, n) => ((m[0].zc + m[1].zc + m[2].zc) - (n[0].zc + n[1].zc + n[2].zc)));
+
+    const cliffAt = world.relief * R * 0.035;
+    for (const face of faces) {
+      stats.cells++;
+      // the surface this face belongs to: the highest of its three corners
+      let top = face[0];
+      for (const v of face) if (v.y > top.y) top = v;
+      const water = top.water;
+      const spread = Math.max(top.y, face[0].y, face[1].y, face[2].y)
+        - Math.min(top.y, face[0].y, face[1].y, face[2].y);
+
+      // light it with the realm's own sun
+      const e1 = sub(face[1], face[0]);
+      const e2 = sub(face[2], face[0]);
+      let nrm = cross(e1, e2);
+      if (nrm[1] < 0) nrm = [-nrm[0], -nrm[1], -nrm[2]];
+      if (water) {
+        // A sea is flat, and a flat plane lit by a sun is one flat colour —
+        // the largest region in Vánheimr would read as a field of paint. Give
+        // the surface two crossed swells and shade by their gradient instead,
+        // so the water moves and catches the light the way water does.
+        const w = world.waves || 1;
+        const gx = Math.cos(top.x * 0.42 * w + top.z * 0.21 * w) * 0.42 * w
+          - Math.cos(top.x * 0.17 * w - top.z * 0.5 * w) * 0.09 * w;
+        const gz = Math.cos(top.x * 0.42 * w + top.z * 0.21 * w) * 0.21 * w
+          + Math.cos(top.x * 0.17 * w - top.z * 0.5 * w) * 0.5 * w;
+        nrm = [-gx, 1, -gz];
+      }
+      const nl = Math.hypot(nrm[0], nrm[1], nrm[2]) || 1;
+      const lam = Math.max(0, (nrm[0] * world.sun[0] + nrm[1] * world.sun[1] + nrm[2] * world.sun[2]) / nl);
+
+      let hue = water ? pal.water[0] : pal.mid[0];
+      let sat = water ? pal.water[1] : pal.mid[1];
+      // the ground sits below the wood in value, so the boughs still read
+      let light = water ? pal.water[2] * 0.8 : pal.mid[2] * 0.88;
+      if (spread > cliffAt) {
+        // a face this steep is a cliff: exposed, darker, more saturated rock
+        hue = pal.dark[0];
+        sat = Math.min(90, pal.dark[1] * 1.2);
+        light = pal.dark[2] * (0.9 + 0.7 * lam);
+      } else {
+        light *= 0.58 + 0.86 * lam;
+        // high ground catches a little of the sky
+        light += clamp(top.y / (R * 0.16), 0, 1) * (water ? 3 : 9);
+      }
+
+      const fade = clamp((top.a + face[0].a + face[1].a + face[2].a) / 4, 0, 1);
+      // aerial perspective: the far side of the realm loses contrast
+      const far = clamp(1 - top.a * 1.6, 0, 1);
+      const alpha = (water ? 0.5 : 0.94) * fade * (1 - far * 0.3);
+
+      ctx.beginPath();
+      ctx.moveTo(face[0].sx, face[0].sy);
+      ctx.lineTo(face[1].sx, face[1].sy);
+      ctx.lineTo(face[2].sx, face[2].sy);
+      ctx.closePath();
+      ctx.fillStyle = hsl(hue, sat, lerp(light, pal.high[2] * 0.5, far * 0.45), alpha);
+      ctx.fill();
+      if (water && lam > 0.62) {
+        // a sheen, only where the sun actually reaches the swell
+        ctx.fillStyle = hsl(pal.accent[0], pal.accent[1], pal.accent[2], 0.16 * (lam - 0.62) * 3 * fade);
+        ctx.fill();
+      }
+    }
+
+    // the sub-region boundaries, so a world reads as *several* places even
+    // before you can see what is in them
+    if (tier === TIERS.NEAR) this.drawRegionEdges(ctx, realm, RINGS, SECTORS, rot, floorY);
+  }
+
+  /** where one sub-region hands over to the next */
+  drawRegionEdges(ctx, realm, RINGS, SECTORS, rot, floorY) {
+    const engine = this.engine;
+    const world = realm.world;
+    const c = realm.center;
+    const R = realm.radius;
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= RINGS; i++) {
+      const fr = Math.pow(i / RINGS, 0.82);
+      let last = null;
+      for (let j = 0; j <= SECTORS; j++) {
+        const a = (j % SECTORS) / SECTORS * TAU + rot;
+        const x = Math.cos(a) * fr * R;
+        const z = Math.sin(a) * fr * R;
+        const g = groundAt(world, x, z);
+        const id = g ? g.region.id : null;
+        if (last !== null && id !== last) {
+          const p = engine.project([c[0] + x, floorY + (g ? g.y : 0), c[2] + z]);
+          if (p) {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, Math.max(0.8, 1.4 * p.s), 0, TAU);
+            ctx.fillStyle = hsl(world.palette.accent[0], 40, world.palette.accent[2], 0.16 * p.a);
+            ctx.fill();
+          }
+        }
+        last = id;
+      }
+    }
+  }
+
+  /**
+   * A ceiling. Svartálfaheimr is under the mountain, and a world with a roof is
+   * a different world from one without: it darkens, it closes in, and the
+   * landmarks beneath it stop being the whole of the sky.
+   */
+  drawRoof(ctx, realm, tier) {
+    const world = realm.world;
+    if (!world.roof || tier === TIERS.FAR) return;
+    const engine = this.engine;
+    const c = realm.center;
+    const R = realm.radius;
+    const y = c[1] - world.floor + world.roof * R * 1.5;
+    const steps = 22;
+    const outer = [];
+    const inner = [];
+    for (let s = 0; s <= steps; s++) {
+      const a = (s / steps) * TAU;
+      const jag = rnd(world.salt, `roof${s}`) * 0.6 + 0.2;
+      const ro = R * 1.06;
+      const ri = R * (0.5 + jag * 0.3);
+      const po = engine.project([c[0] + Math.cos(a) * ro, y, c[2] + Math.sin(a) * ro]);
+      const pi = engine.project([c[0] + Math.cos(a) * ri, y - world.roof * R * jag * 0.8, c[2] + Math.sin(a) * ri]);
+      if (!po || !pi) return;
+      outer.push(po);
+      inner.push(pi);
+    }
+    ctx.beginPath();
+    ctx.moveTo(outer[0].x, outer[0].y);
+    for (let s = 1; s < outer.length; s++) ctx.lineTo(outer[s].x, outer[s].y);
+    for (let s = inner.length - 1; s >= 0; s--) ctx.lineTo(inner[s].x, inner[s].y);
+    ctx.closePath();
+    const g = ctx.createLinearGradient(0, outer[0].y, 0, inner[0].y);
+    g.addColorStop(0, 'rgba(2,2,3,0.94)');
+    g.addColorStop(1, hsl(world.palette.dark[0], 30, 8, 0.86));
+    ctx.fillStyle = g;
+    ctx.fill();
+    // the underside catches a little of the realm's own light
+    ctx.strokeStyle = hsl(world.palette.accent[0], 40, world.palette.accent[2], 0.1);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(inner[0].x, inner[0].y);
+    for (let s = 1; s < inner.length; s++) ctx.lineTo(inner[s].x, inner[s].y);
+    ctx.stroke();
+  }
+
+  /**
+   * Roads, causeways and spans: the polylines between landmarks, following the
+   * ground. They are what make a world navigable before anything is walking on
+   * it — a viewer can see where a place connects to.
+   */
+  drawPaths(ctx, realm, tier) {
+    const engine = this.engine;
+    const world = realm.world;
+    const c = realm.center;
+    const floorY = c[1] - world.floor;
+    const accent = world.palette.accent;
+    for (const path of world.paths) {
+      const pts = path.points.map(([x, y, z]) => engine.project([c[0] + x, floorY + y, c[2] + z]));
+      if (pts.some((p) => !p)) continue;
+      const wide = path.kind === 'span';
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length - 1; i++) {
+        ctx.quadraticCurveTo(pts[i].x, pts[i].y,
+          (pts[i].x + pts[i + 1].x) / 2, (pts[i].y + pts[i + 1].y) / 2);
+      }
+      ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+      if (wide) {
+        // a span has rails: it is a bridge, and a bridge has a deck
+        ctx.strokeStyle = hsl(accent[0], accent[1] * 0.7, accent[2] * 0.8, 0.16 * pts[0].a);
+        ctx.lineWidth = Math.max(0.8, 0.8 * pts[0].s);
+        ctx.stroke();
+        ctx.strokeStyle = hsl(accent[0], accent[1], accent[2] * 0.6, 0.09 * pts[0].a);
+        ctx.lineWidth = Math.max(0.4, 0.4 * pts[0].s);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = hsl(accent[0], accent[1] * 0.5, accent[2] * 0.9, 0.11 * pts[0].a);
+        ctx.lineWidth = Math.max(0.5, 0.45 * pts[0].s);
+        ctx.stroke();
+      }
+      if (tier === TIERS.NEAR) {
+        // waymarks, so the road is a made thing and not a hint
+        for (let i = 2; i < pts.length - 1; i += 3) {
+          ctx.beginPath();
+          ctx.arc(pts[i].x, pts[i].y, Math.max(0.4, 0.22 * pts[i].s), 0, TAU);
+          ctx.fillStyle = hsl(accent[0], accent[1], accent[2], 0.26 * pts[i].a);
+          ctx.fill();
+        }
+      }
+    }
+  }
+
+  /**
+   * Everything standing on the land — the realm's landmarks and its instanced
+   * detail — in one depth-sorted pass, so a colonnade really does stand in
+   * front of the hall behind it.
+   */
+  drawPopulation(ctx, realm, tier, stats) {
+    const engine = this.engine;
+    const world = realm.world;
+    const c = realm.center;
+    const floorY = c[1] - world.floor;
+    const at = (x, y, z) => engine.project([c[0] + x, floorY + y, c[2] + z]);
+
+    const queue = [];
+    for (const lm of world.landmarks) {
+      const p = at(lm.x, lm.y, lm.z);
+      if (!p) continue;
+      queue.push({
+        p,
+        motif: { kind: lm.kind, height: lm.h, width: lm.w, spin: lm.spin },
+        opts: { hero: !!lm.central },
+      });
+      stats.landmarks++;
+    }
+    if (tier === TIERS.NEAR) {
+      // generated here, not before: the detail of a realm you are not standing
+      // in has no reason to exist
+      for (const it of instances(world, tier)) {
+        const p = at(it.x, it.y, it.z);
+        if (!p) continue;
+        // Cull by size here rather than inside the draw, so the queue only
+        // holds work worth doing and the counters mean something. A two-pixel
+        // stone is not detail, it is a smudge.
+        const px = it.h * p.s;
+        if (!(px >= 2.2)) continue;
+        queue.push({
+          p,
+          motif: { kind: it.kind, height: it.h, width: it.w, spin: it.spin },
+        });
+        stats.detail++;
+      }
+    }
+    queue.sort((a, b) => b.p.z - a.p.z);
+    for (const item of queue) {
+      this.drawMotif(ctx, item.motif, item.p, floorY, realm, engine, item.opts);
+    }
+  }
+
+  /**
+   * The agents that are actually in this place.
+   *
+   * An agent is a small body on the ground with a disc of perception around it,
+   * and the disc is the point: it is drawn at the same radius the agent
+   * actually perceives at, so what you see on screen is exactly what it knows.
+   * A memory inside the disc has been noticed; one outside it has not, however
+   * close it looks.
+   *
+   * This is optional and costs nothing when there are no agents: the whole
+   * method returns on the first line if the engine has no agent world, which is
+   * the normal state of the app until one is spawned.
+   */
+  drawAgents(ctx, realm) {
+    const engine = this.engine;
+    const agentWorld = engine.agentWorld;
+    if (!agentWorld || !agentWorld.agents.length) return;
+
+    const hue = realm.hue ?? 44;
+    for (const agent of agentWorld.agents) {
+      if (agent.realmId !== realm.id) continue;
+
+      const p = engine.project(agent.pos);
+      if (!p) continue;
+
+      // the perception disc, drawn flat on the ground it is measured over. It is
+      // an ellipse because the ground is, so it reads as lying on the land
+      // rather than floating in front of it.
+      const range = agent.range || 0;
+      if (range > 0) {
+        const edge = engine.project([agent.pos[0], agent.pos[1], agent.pos[2]]);
+        const rim = engine.project([
+          agent.pos[0] + Math.cos(agent.yaw) * range,
+          agent.pos[1],
+          agent.pos[2] + Math.sin(agent.yaw) * range,
+        ]);
+        const back = engine.project([
+          agent.pos[0] - Math.cos(agent.yaw) * range,
+          agent.pos[1],
+          agent.pos[2] - Math.sin(agent.yaw) * range,
+        ]);
+        const left = engine.project([
+          agent.pos[0],
+          agent.pos[1],
+          agent.pos[2] + range,
+        ]);
+        if (edge && rim && back && left && left.z > 0.6) {
+          const r = Math.hypot(rim.x - p.x, rim.y - p.y);
+          const rBack = Math.hypot(back.x - p.x, back.y - p.y);
+          const flat = Math.abs(left.y - p.y);
+          const squash = clamp(flat / Math.max(r, rBack, 0.001), 0.05, 1);
+          ctx.save();
+          ctx.beginPath();
+          ctx.ellipse(p.x, p.y, (r + rBack) / 2, ((r + rBack) / 2) * squash, 0, 0, TAU);
+          ctx.strokeStyle = hsl(hue, 70, 70, 0.3 * p.a);
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 4]);
+          ctx.stroke();
+          ctx.fillStyle = hsl(hue, 70, 60, 0.05 * p.a);
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+
+      // the body: a mark on the ground with a facing, so you can see which way
+      // it is looking without reading the debug panel
+      const r = clamp(1.6 * p.s, 2.2, 9);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, TAU);
+      ctx.fillStyle = hsl(hue, 74, 68, 0.9 * p.a);
+      ctx.fill();
+      // the facing, as a short bright stroke
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x + Math.cos(agent.yaw) * r * 2.1, p.y + Math.sin(agent.yaw) * r * 1.4);
+      ctx.strokeStyle = hsl(hue, 90, 82, 0.85 * p.a);
+      ctx.lineWidth = Math.max(1, r * 0.42);
+      ctx.lineCap = 'round';
+      ctx.stroke();
+      ctx.restore();
+
+      // its id, so more than one agent in a realm is distinguishable
+      if (p.s > 0.4 && agent.name) {
+        ctx.save();
+        ctx.font = `${Math.max(7, Math.round(r * 0.9))}px ui-monospace, monospace`;
+        ctx.fillStyle = hsl(hue, 60, 88, 0.75 * p.a);
+        ctx.textAlign = 'center';
+        ctx.fillText(agent.name, p.x, p.y - r * 1.8);
+        ctx.restore();
+      }
+    }
+  }
+
+  /**
+   * The weather. Layers are declared per realm and behave differently in each
+   * one: mist drifts, embers rise, frost falls, stars hold still. Drawn in two
+   * passes so weather can sit both behind and in front of the land.
+   */
+  drawAtmosphere(ctx, realm, tier, pass) {
+    if (tier === TIERS.FAR) return;
+    const engine = this.engine;
+    const world = realm.world;
+    const c = realm.center;
+    const R = realm.radius;
+    const t = engine.time;
+    const pal = world.palette;
+    const sky = world.sky;
+
+    for (const layer of world.layers) {
+      if ((layer.pass || 'front') !== pass) continue;
+      const a = layer.alpha * (tier === TIERS.MID ? 0.6 : 1);
+      const drift = (layer.speed ?? 0.1) * t;
+      switch (layer.kind) {
+        case 'mist':
+        case 'cloud': {
+          const isCloud = layer.kind === 'cloud';
+          for (let i = 0; i < 5; i++) {
+            const ang = (i / 5) * TAU + rnd(world.salt, `mst${i}`) * 1.2;
+            const rad = R * (0.25 + rnd(world.salt, `msr${i}`) * 0.7);
+            const wob = Math.sin(t * (0.3 + i * 0.11) + i) * R * 0.1;
+            const y = layer.y * R + Math.sin(t * 0.2 + i) * R * 0.02;
+            const p = engine.project([c[0] + Math.cos(ang + drift * 0.1) * rad + wob,
+              c[1] - world.floor + y, c[2] + Math.sin(ang + drift * 0.1) * rad]);
+            if (!p) continue;
+            const s = Math.min(R * 0.5, R * (0.16 + rnd(world.salt, `mss${i}`) * 0.24) * p.s);
+            const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, s);
+            g.addColorStop(0, hsl(isCloud ? 42 : pal.high[0], isCloud ? 26 : 20,
+              isCloud ? 44 : 38, a));
+            g.addColorStop(1, hsl(isCloud ? 42 : pal.high[0], 20, 28, 0));
+            ctx.fillStyle = g;
+            ctx.beginPath();
+            ctx.ellipse(p.x, p.y, s, s * 0.3, 0, 0, TAU);
+            ctx.fill();
+          }
+          break;
+        }
+        case 'ray': {
+          // light coming down into the place, which is what a citadel and a
+          // well both have and most places do not
+          const top = engine.project([c[0], c[1] - world.floor + R * (layer.y + 0.35), c[2]]);
+          const base = engine.project([c[0], c[1] - world.floor - R * 0.1, c[2]]);
+          if (!top || !base) break;
+          for (let i = 0; i < 4; i++) {
+            const off = (i - 1.5) * R * 0.42;
+            const w = R * (0.08 + rnd(world.salt, `ry${i}`) * 0.12) * top.s;
+            const lean = R * 0.16 * top.s;
+            const g = ctx.createLinearGradient(top.x + off, top.y, base.x + off + lean, base.y);
+            g.addColorStop(0, hsl(sky[0] + 6, 60, 68, a * 1.3));
+            g.addColorStop(1, hsl(sky[0] + 6, 60, 58, 0));
+            ctx.fillStyle = g;
+            ctx.beginPath();
+            ctx.moveTo(top.x + off - w, top.y);
+            ctx.lineTo(top.x + off + w, top.y);
+            ctx.lineTo(base.x + off + lean + w * 1.6, base.y);
+            ctx.lineTo(base.x + off + lean - w * 1.6, base.y);
+            ctx.closePath();
+            ctx.fill();
+          }
+          break;
+        }
+        case 'ember':
+        case 'frost':
+        case 'pollen': {
+          // motes with a direction: embers climb out of the ground, frost falls
+          const rising = layer.kind === 'ember';
+          const n = tier === TIERS.NEAR ? 22 : 10;
+          for (let i = 0; i < n; i++) {
+            const px0 = (rnd(world.salt, `pt${i}`) * 2 - 1) * R;
+            const pz0 = (rnd(world.salt, `pp${i}`) * 2 - 1) * R;
+            const g0 = groundAt(world, px0, pz0);
+            const baseY = g0 ? g0.y : 0;
+            const span = R * 1.5;
+            const phase = rnd(world.salt, `pq${i}`);
+            const k = ((rising ? 1 : -1) * (layer.speed ?? 0.3) * t * 0.5 + phase) % 1;
+            const y = baseY + (k < 0 ? k + 1 : k) * span;            const p = engine.project([c[0] + px0 + Math.sin(t * 0.6 + phase * 9) * R * 0.06,
+              c[1] - world.floor + y,
+              c[2] + pz0 + Math.cos(t * 0.5 + phase * 7) * R * 0.06,
+            ]);
+            if (!p) continue;
+            const size = Math.min(3.4, Math.max(0.6, (rising ? 1.1 : 0.9) * p.s));
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, size, 0, TAU);
+            ctx.fillStyle = layer.kind === 'ember'
+              ? hsl(24, 88, 62, a * (0.4 + 0.6 * (k < 0.5 ? k * 2 : (1 - k) * 2)))
+              : layer.kind === 'frost'
+                ? hsl(198, 40, 82, a * 0.7)
+                : hsl(88, 52, 74, a * 0.7);
+            ctx.fill();
+          }
+          break;
+        }
+        case 'star': {
+          // the only light in the abyss, and the reason the abyss has a shape
+          const n = tier === TIERS.NEAR ? 90 : 34;
+          for (let i = 0; i < n; i++) {
+            const ang = rnd(world.salt, `sx${i}`) * TAU;
+            const rad = R * (0.2 + rnd(world.salt, `sr${i}`) * 1.15);
+            const y = c[1] + (rnd(world.salt, `sy${i}`) - 0.5) * R * 2.2;
+            const p = engine.project([c[0] + Math.cos(ang) * rad, y, c[2] + Math.sin(ang) * rad]);
+            if (!p) continue;
+            const tw = 0.55 + 0.45 * Math.sin(t * (0.6 + i * 0.07) + i);
+            // A star is a point. Left unclamped it is a 70-pixel disc whenever
+            // one happens to be near the camera, and the abyss fills with fog.
+            const size = Math.min(3.0, Math.max(0.4, rnd(world.salt, `ss${i}`) * 1.6 * p.s));
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, size, 0, TAU);
+            ctx.fillStyle = `rgba(255,248,232,${(a * tw * 0.62).toFixed(3)})`;
+            ctx.fill();
+          }
+          break;
+        }
+        case 'veil':
+        case 'storm': {
+          for (let i = 0; i < 3; i++) {
+            const ang = (i / 3) * TAU + drift * 0.16;
+            const rad = R * (0.45 + rnd(world.salt, `vr${i}`) * 0.5);
+            const top = engine.project([c[0] + Math.cos(ang) * rad,
+              c[1] - world.floor + R * layer.y, c[2] + Math.sin(ang) * rad]);
+            const bot = engine.project([c[0] + Math.cos(ang) * rad * 0.8,
+              c[1] - world.floor, c[2] + Math.sin(ang) * rad * 0.8]);
+            if (!top || !bot) continue;
+            const w = R * 0.4 * top.s;
+            const g = ctx.createLinearGradient(top.x, top.y, bot.x, bot.y);
+            g.addColorStop(0, hsl(layer.kind === 'storm' ? 22 : pal.high[0], 26, 56, a));
+            g.addColorStop(1, hsl(layer.kind === 'storm' ? 22 : pal.high[0], 26, 40, 0));
+            ctx.fillStyle = g;
+            ctx.beginPath();
+            ctx.moveTo(top.x - w, top.y);
+            ctx.lineTo(top.x + w, top.y);
+            ctx.lineTo(bot.x + w * 1.5, bot.y);
+            ctx.lineTo(bot.x - w * 1.5, bot.y);
+            ctx.closePath();
+            ctx.fill();
+          }
+          break;
+        }
+        case 'glow': {
+          // light off the forges, pooling on the floor. Sized from the realm's
+          // own projected radius rather than from depth, so it pools the same
+          // way however close the camera is.
+          const p = engine.project([c[0], c[1] - world.floor + R * layer.y, c[2]]);
+          const hub = engine.project(realm.center);
+          if (!p || !hub) break;
+          const s = R * hub.s * 1.3;
+          const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, s);
+          g.addColorStop(0, hsl(28, 90, 54, a));
+          g.addColorStop(1, hsl(28, 90, 40, 0));
+          ctx.fillStyle = g;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, s, 0, TAU);
+          ctx.fill();
+          break;
+        }
+        default: break;
+      }
     }
   }
 
@@ -1095,18 +1768,41 @@ export class Organism {
     }
   }
 
-  /** one landmark, drawn as a silhouette in the realm's own space */
-  drawMotif(ctx, motif, p, floorY, centre, engine) {
+  /**
+   * One piece of architecture or scenery, as a silhouette standing on the
+   * ground at `p`. This is the whole component library: every landmark and
+   * every instanced detail in every realm is one of these cases, drawn once per
+   * instance. `p` is the *base* — the point where it meets the ground — so
+   * anything that follows the terrain follows it exactly.
+   */
+  drawMotif(ctx, motif, p, floorY, centre, engine, opts = {}) {
+    const { hero = false, min = 1.1 } = opts;
     const s = p.s;
     const h = motif.height * s;
     const w = motif.width * s;
-    if (h < 1.2) return;
-    const base = p.y + h * 0.5;
+    // NaN fails every comparison, so this has to be an explicit finite check:
+    // a non-finite size reaches createRadialGradient and takes the frame down
+    if (!(h >= min) || !(w >= min * 0.2)) return;
+    const base = p.y;
     const fade = clamp(p.a ?? 1, 0, 1);
     const gh = centre.hue ?? 44;
+    const pal = centre.world?.palette;
     const tint = (l, a) => hsl(gh, 30, l, a * fade);
+    // the palette a realm grew for its own architecture, not the tree's gold
+    const paint = pal ? (l, a, s2) => hsl(pal.mid[0], pal.mid[1], l, a * fade) : tint;
     ctx.save();
-    ctx.translate(p.x, base);
+    ctx.translate(p.x, base);      if (hero) {
+      // a landmark big enough to be the reason the realm is named deserves to
+      // be legible at a distance, so it gets a light behind it — but a glow
+      // scaled to the whole silhouette becomes fog over the landscape
+      const g = ctx.createRadialGradient(0, -h * 0.5, 0, 0, -h * 0.5, Math.max(h, w) * 0.9);
+      g.addColorStop(0, hsl(pal ? pal.accent[0] : gh, 70, 62, 0.1 * fade));
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(0, -h * 0.5, Math.max(h, w) * 1.5, 0, TAU);
+      ctx.fill();
+    }
     ctx.beginPath();
     switch (motif.kind) {
       case 'hall':      // the great hall of the Aesir: a long roof on piers
@@ -1332,6 +2028,212 @@ export class Organism {
         ctx.quadraticCurveTo(0, -h * 0.4, w * 3, 0);
         ctx.stroke();
         break;
+
+      // ── the component library, extended for the new landforms ──────────
+      case 'terrace': { // a made platform: the mark of a place that was built
+        const steps = 4;
+        for (let i = 0; i < steps; i++) {
+          const t = i / steps;
+          ctx.fillStyle = paint(30 - i * 4, 0.9 - t * 0.3);
+          ctx.fillRect(-w * (2.4 - t * 1.1), -h * (0.2 + t * 0.8), w * (4.8 - t * 2.2), h * 0.24);
+        }
+        ctx.fillStyle = hsl(pal ? pal.accent[0] : gh, 60, pal ? pal.accent[2] : 60, 0.4 * fade);
+        ctx.fillRect(-w * 0.9, -h, w * 1.8, h * 0.22);
+        break;
+      }
+      case 'colonnade': { // a row of piers, which reads as architecture at any size
+        const piers = 5;
+        for (let i = 0; i < piers; i++) {
+          const t = i / (piers - 1);
+          const x = (t - 0.5) * w * 4.4;
+          const hh = h * (0.72 + Math.sin(t * Math.PI) * 0.28);
+          ctx.fillStyle = paint(32 - Math.abs(t - 0.5) * 16, 0.88);
+          ctx.fillRect(x - w * 0.22, -hh, w * 0.44, hh);
+        }
+        // the architrave across the top: what makes it a building
+        ctx.fillStyle = paint(38, 0.8);
+        ctx.fillRect(-w * 2.4, -h, w * 4.8, h * 0.12);
+        break;
+      }
+      case 'banner': { // what a place looks like when it is at its festival
+        ctx.strokeStyle = paint(30, 0.85);
+        ctx.lineWidth = Math.max(0.8, w * 0.16);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(0, -h);
+        ctx.stroke();
+        const wave = Math.sin(this.engine.time * 1.6 + motif.spin) * w * 0.5;
+        ctx.beginPath();
+        ctx.moveTo(0, -h);
+        ctx.lineTo(w * 2.1, -h + h * 0.12 + wave * 0.1);
+        ctx.lineTo(w * 1.7, -h * 0.7 + wave * 0.16);
+        ctx.lineTo(0, -h * 0.72);
+        ctx.closePath();
+        ctx.fillStyle = hsl(pal ? pal.accent[0] : gh, 78, pal ? pal.accent[2] : 62, 0.55 * fade);
+        ctx.fill();
+        break;
+      }
+      case 'grove': { // a wood seen as one mass, with its own edge
+        for (let i = 0; i < 7; i++) {
+          const a = (i / 7) * TAU + motif.spin;
+          const d = w * (0.5 + (i % 3) * 0.5);
+          const x = Math.cos(a) * d;
+          const hh = h * (0.5 + ((i * 37) % 10) / 14);
+          ctx.strokeStyle = paint(26, 0.7);
+          ctx.lineWidth = Math.max(0.5, w * 0.14);
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, -hh * 0.5);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.ellipse(x, -hh * 0.68, w * 0.7, hh * 0.34, 0, 0, TAU);
+          ctx.fillStyle = paint(30, 0.62);
+          ctx.fill();
+        }
+        break;
+      }
+      case 'fissure': { // a crack in the world, with something down it
+        const jag = 0.4 + 0.6 * Math.abs(Math.sin(motif.spin));
+        ctx.moveTo(-w * 1.6, 0);
+        ctx.lineTo(-w * 0.3, -h * 0.3 * jag);
+        ctx.lineTo(w * 0.1, h * 0.1);
+        ctx.lineTo(w * 0.6, -h * 0.22 * jag);
+        ctx.lineTo(w * 1.7, 0);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(0,0,0,0.88)';
+        ctx.fill();
+        ctx.strokeStyle = hsl(24, 88, 58, 0.34 * fade);
+        ctx.lineWidth = Math.max(0.6, w * 0.1);
+        ctx.beginPath();
+        ctx.moveTo(-w * 1.4, -h * 0.02);
+        ctx.lineTo(-w * 0.2, -h * 0.26 * jag);
+        ctx.lineTo(w * 0.5, -h * 0.18 * jag);
+        ctx.stroke();
+        break;
+      }
+      case 'moraine': { // a ridge of rock someone pushed here
+        for (let i = 0; i < 5; i++) {
+          const t = (i / 4 - 0.5) * 2;
+          const hh = h * (0.45 + (1 - Math.abs(t)) * 0.55);
+          ctx.beginPath();
+          ctx.moveTo(t * w * 2.4 - w * 0.8, 0);
+          ctx.lineTo(t * w * 2.4, -hh);
+          ctx.lineTo(t * w * 2.4 + w * 0.8, 0);
+          ctx.closePath();
+          ctx.fillStyle = paint(24 - i, 0.8);
+          ctx.fill();
+        }
+        break;
+      }
+      case 'glacier': { // a wedge of ice that has stopped moving
+        ctx.moveTo(-w * 1.8, 0);
+        ctx.lineTo(-w * 0.4, -h);
+        ctx.lineTo(w * 0.9, -h * 0.72);
+        ctx.lineTo(w * 1.8, 0);
+        ctx.closePath();
+        ctx.fillStyle = hsl(198, 46, 52, 0.66 * fade);
+        ctx.fill();
+        ctx.strokeStyle = hsl(194, 50, 82, 0.3 * fade);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(-w * 0.4, -h);
+        ctx.lineTo(-w * 0.1, -h * 0.3);
+        ctx.lineTo(w * 0.5, 0);
+        ctx.stroke();
+        break;
+      }
+      case 'shaft': { // a shaft of worked rock, with the light coming up it
+        ctx.moveTo(-w * 0.7, 0);
+        ctx.lineTo(-w * 0.5, -h);
+        ctx.lineTo(w * 0.5, -h);
+        ctx.lineTo(w * 0.7, 0);
+        ctx.closePath();
+        ctx.fillStyle = paint(20, 0.9);
+        ctx.fill();
+        const g = ctx.createLinearGradient(0, 0, 0, -h);
+        g.addColorStop(0, hsl(38, 92, 62, 0.7 * fade));
+        g.addColorStop(1, hsl(38, 92, 62, 0));
+        ctx.fillStyle = g;
+        ctx.fillRect(-w * 0.22, -h, w * 0.44, h);
+        break;
+      }
+      case 'barrage': { // a weir: the reason the water above is standing still
+        for (let i = 0; i < 3; i++) {
+          ctx.fillStyle = paint(28 - i * 5, 0.85);
+          ctx.fillRect(-w * (2 - i * 0.4), -h * (0.3 + i * 0.3), w * (4 - i * 0.8), h * 0.3);
+        }
+        ctx.strokeStyle = hsl(pal ? pal.water?.[0] ?? 196 : 196, 60, 70, 0.4 * fade);
+        ctx.lineWidth = Math.max(0.6, w * 0.12);
+        ctx.beginPath();
+        ctx.moveTo(-w * 2, 0);
+        ctx.lineTo(w * 2, 0);
+        ctx.stroke();
+        break;
+      }
+      case 'rune': { // a standing stone with a mark on it
+        ctx.moveTo(-w * 0.4, 0);
+        ctx.lineTo(-w * 0.28, -h);
+        ctx.lineTo(w * 0.34, -h * 0.9);
+        ctx.lineTo(w * 0.46, 0);
+        ctx.closePath();
+        ctx.fillStyle = paint(18, 0.9);
+        ctx.fill();
+        const glow = 0.5 + 0.5 * Math.sin(this.engine.time * 1.1 + motif.spin);
+        ctx.strokeStyle = hsl(pal ? pal.accent[0] : 196, 80, pal ? pal.accent[2] : 70,
+          (0.28 + glow * 0.3) * fade);
+        ctx.lineWidth = Math.max(0.6, w * 0.16);
+        ctx.beginPath();
+        ctx.moveTo(0, -h * 0.78);
+        ctx.lineTo(0, -h * 0.34);
+        ctx.moveTo(-w * 0.16, -h * 0.62);
+        ctx.lineTo(w * 0.16, -h * 0.62);
+        ctx.stroke();
+        break;
+      }
+      case 'lattice': { // a structure that is more air than matter
+        ctx.strokeStyle = pal
+          ? hsl(pal.accent[0], pal.accent[1] * 0.6, pal.accent[2] * 0.7, 0.6 * fade)
+          : tint(34, 0.7);
+        ctx.lineWidth = Math.max(0.7, w * 0.16);
+        for (let i = -1; i <= 1; i++) {
+          ctx.beginPath();
+          ctx.moveTo(i * w * 1.3, 0);
+          ctx.lineTo(i * w * 0.5, -h);
+          ctx.moveTo(i * w * 0.5, -h);
+          ctx.lineTo(i * w * 1.3, 0);
+          ctx.stroke();
+        }
+        ctx.beginPath();
+        ctx.moveTo(-w * 1.5, -h * 0.34);
+        ctx.lineTo(w * 1.5, -h * 0.34);
+        ctx.stroke();
+        break;
+      }
+      case 'shelf': { // the lip of floating ground: what you could fall off
+        ctx.moveTo(-w * 2.2, 0);
+        ctx.lineTo(w * 2.2, 0);
+        ctx.lineTo(w * 1.4, -h * 0.5);
+        ctx.lineTo(-w * 1.2, -h * 0.42);
+        ctx.closePath();
+        ctx.fillStyle = paint(30, 0.85);
+        ctx.fill();
+        ctx.strokeStyle = hsl(44, 40, 74, 0.24 * fade);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(-w * 2.2, 0);
+        ctx.lineTo(w * 2.2, 0);
+        ctx.stroke();
+        break;
+      }
+      case 'strata': { // the layered rock of a world with no bottom
+        for (let i = 0; i < 5; i++) {
+          const t = i / 5;
+          ctx.fillStyle = paint(26 - i * 3, 0.7 - t * 0.25);
+          ctx.fillRect(-w * (1.4 - t * 0.5), -h * (t + 0.2),
+            w * (2.8 - t * 1), h * 0.2);
+        }
+        break;
+      }
       default:
         ctx.rect(-w * 0.5, -h * 0.8, w, h * 0.8);
         ctx.fillStyle = tint(28, 0.7);
@@ -1361,12 +2263,21 @@ export class Organism {
     ctx.strokeStyle = hsl(realm.hue ?? 44, 60, 55, 0.12);
     ctx.lineWidth = 1;
     ctx.stroke();
+  }
 
-    // root filaments drifting under the realm, for depth
-    for (let i = 0; i < 18; i++) {
-      const a = (i / 18) * TAU + rnd('floor', `a${i}`) * 0.3;
+  /**
+   * Root filaments drifting under the realm. Drawn *before* the world, because
+   * they are underneath it — and because drawing them afterwards meant they
+   * hung across the land like scratches on the lens.
+   */
+  drawUnderRealm(ctx, realm) {
+    const engine = this.engine;
+    const tier = this.tier ?? TIERS.NEAR;
+    const count = tier === TIERS.NEAR ? 12 : tier === TIERS.MID ? 6 : 0;
+    for (let i = 0; i < count; i++) {
+      const a = (i / 12) * TAU + rnd('floor', `a${i}`) * 0.3;
       const r = realm.radius * (0.5 + rnd('floor', `r${i}`) * 0.8);
-      const centre = add(realm.center, [Math.cos(a) * r, -realm.radius * 0.75, Math.sin(a) * r]);
+      const centre = add(realm.center, [Math.cos(a) * r, -realm.radius * 0.95, Math.sin(a) * r]);
       const s = engine.project(centre);
       if (!s) continue;
       const len = (12 + rnd('floor', `l${i}`) * 26) * s.s;
@@ -1374,7 +2285,7 @@ export class Organism {
       ctx.moveTo(s.x, s.y);
       ctx.quadraticCurveTo(s.x + Math.cos(a) * len, s.y + len * 0.4,
         s.x + Math.cos(a) * len * 1.6, s.y + len * 0.9);
-      ctx.strokeStyle = hsl(realm.hue ?? 44, 55, 52, 0.16 * s.a);
+      ctx.strokeStyle = hsl(realm.hue ?? 44, 55, 52, 0.13 * s.a);
       ctx.lineWidth = Math.max(0.4, 0.9 * s.s * 0.2);
       ctx.stroke();
     }

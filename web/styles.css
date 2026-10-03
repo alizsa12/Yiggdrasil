@@ -584,6 +584,58 @@ input[type=range]::-moz-range-thumb {
 ::-webkit-scrollbar-thumb { background: rgba(220,180,110,0.2); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(220,180,110,0.38); }
 
+/* ─────────────────────────────────────────── the agent developer view */
+/* A plain panel of text in the corner. It is a tool for reading what an agent
+   knows while it walks, so it is deliberately unadorned: monospace, labelled
+   rows, and nothing that could be mistaken for part of the world itself. */
+.agent-debug {
+  position: fixed;
+  left: 14px;
+  bottom: 14px;
+  z-index: 40;
+  width: 330px;
+  max-height: 62vh;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--glass-solid);
+  border: 1px solid var(--edge-strong);
+  box-shadow: var(--shadow), 0 0 34px rgba(200, 150, 70, 0.14);
+  backdrop-filter: blur(16px);
+  font: 10.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--ink-dim);
+}
+.agent-debug header {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 8px; padding-bottom: 6px;
+  border-bottom: 1px solid var(--edge);
+  color: var(--gold);
+  text-transform: uppercase; letter-spacing: 0.1em;
+}
+.agent-debug header span { margin-left: auto; color: var(--ink-faint); }
+.agent-debug header button {
+  appearance: none; border: 1px solid var(--edge); background: transparent;
+  color: var(--ink-faint); border-radius: 5px; cursor: pointer;
+  padding: 0 5px; font: inherit; line-height: 1.4;
+}
+.agent-debug header button:hover { color: var(--ink); border-color: var(--edge-strong); }
+.agent-debug section {
+  padding: 7px 0; margin-bottom: 6px;
+  border-bottom: 1px dashed var(--edge);
+}
+.agent-debug .ad-name {
+  color: var(--ivory); font-size: 11.5px; letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+.agent-debug label {
+  display: inline-block; min-width: 84px;
+  color: var(--ink-faint); text-transform: uppercase; font-size: 9.5px;
+}
+.agent-debug footer {
+  padding-top: 6px; color: var(--ink-faint);
+}
+.agent-debug[hidden] { display: none; }
+
 /* ─────────────────────────────────────────────────────────── responsive */
 @media (max-width: 1180px) {
   :root { --rail-w: 232px; --rail-r-w: 300px; }

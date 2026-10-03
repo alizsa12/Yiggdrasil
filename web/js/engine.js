@@ -139,6 +139,12 @@ export class YggdrasilEngine {
   /**
    * Enter a realm: the camera travels down the limb and into the volume, and
    * from then on the memories are where they were grown, on the boughs.
+   *
+   * It arrives looking *down* at the land rather than level with the middle of
+   * the volume. A realm's ground sits below its centre, so a level camera sees
+   * mostly wood and sky and the country is out of frame entirely; and a ground
+   * plane seen edge-on collapses into a thin band no matter how wide the lens.
+   * Looking down at it is what turns the volume into a place.
    */
   enterRealm(realmId) {
     const realm = this.layout?.realms?.realms.get(realmId);
@@ -148,7 +154,9 @@ export class YggdrasilEngine {
       this.organism.seeded = false;
       this.organism.cosmos = null;
     }
-    this.flyTo(realm.center, realm.radius * 2.15);
+    const world = realm.world;
+    const look = world ? realm.center[1] - world.floor * 0.88 : realm.center[1];
+    this.flyTo([realm.center[0], look, realm.center[2]], realm.radius * 2.5, { pitch: -0.46 });
     this.onRealmChange?.(realmId);
   }
 
